@@ -6,14 +6,14 @@
  *   Y 208 to 319
  *
  * Output:
- *   /home/sean/Documents/OpenInvert-PnP/scans/<scan_id>/
+ *   <OpenPnP config>/scans/<scan_id>/
  *     frames/*.png
  *     manifest.jsonl
  *
  * Cooperative pause/resume/halt:
- *   If /home/sean/Documents/OpenInvert-PnP/control/pause.flag exists, the
+ *   If <OpenPnP config>/control/pause.flag exists, the
  *   scan pauses before the next move. Clearing the flag resumes the same run.
- *   If /home/sean/Documents/OpenInvert-PnP/control/stop.flag exists, the
+ *   If <OpenPnP config>/control/stop.flag exists, the
  *   scan exits before the next move.
  *   The halt control GUI is launched automatically at scan start.
  */
@@ -23,6 +23,16 @@ load(scripting.getScriptsDirectory().toString() + '/Examples/JavaScript/Utility.
 var imports = new JavaImporter(org.openpnp.model, java.io, javax.imageio);
 
 with (imports) {
+    var scriptsDir = new File(scripting.getScriptsDirectory().toString());
+    var projectDir = scriptsDir.getParentFile();
+    var localPython = new File(projectDir, '.venv/bin/python');
+    var previousPython = new File('/home/sean/Documents/OpenInvert-PnP/.venv/bin/python');
+    var python = localPython.exists()
+        ? localPython.getAbsolutePath()
+        : previousPython.exists()
+        ? previousPython.getAbsolutePath()
+        : 'python3';
+
     function pad(number, width) {
         var text = String(number);
         while (text.length < width) {
@@ -109,6 +119,16 @@ with (imports) {
         }
     }
 
+    function appendText(file, text) {
+        var writer = new FileWriter(file, true);
+        try {
+            writer.write(text);
+        }
+        finally {
+            writer.close();
+        }
+    }
+
     function writeStatus(statusFile, status, scanId, frameIndex, totalFrames, message) {
         var record = {
             status: status,
@@ -155,9 +175,7 @@ with (imports) {
     }
 
     function launchHaltGui(controlDir) {
-        var projectDir = new File('/home/sean/Documents/OpenInvert-PnP');
-        var python = '/home/sean/Documents/OpenInvert-PnP/.venv/bin/python';
-        var guiScript = '/home/sean/Documents/OpenInvert-PnP/scripts/00_Halt_Control.py';
+        var guiScript = new File(scriptsDir, '00_Halt_Control.py').getAbsolutePath();
         var stdoutLog = new File(controlDir, 'halt_gui.out.log');
         var stderrLog = new File(controlDir, 'halt_gui.err.log');
 
@@ -176,9 +194,7 @@ with (imports) {
     }
 
     function launchSegmentation(scanDir, controlDir) {
-        var projectDir = new File('/home/sean/Documents/OpenInvert-PnP');
-        var python = '/home/sean/Documents/OpenInvert-PnP/.venv/bin/python';
-        var segmentScript = '/home/sean/Documents/OpenInvert-PnP/scripts/02_Segment_Scan_Objects.py';
+        var segmentScript = new File(scriptsDir, '02_Segment_Scan_Objects.py').getAbsolutePath();
         var stdoutLog = new File(controlDir, 'segmentation.out.log');
         var stderrLog = new File(controlDir, 'segmentation.err.log');
 
@@ -199,6 +215,706 @@ with (imports) {
             print('Failed to launch segmentation: ' + error);
             print('See: ' + stderrLog.getAbsolutePath());
         }
+    }
+
+    function touchTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames) {
+        var touchHeadName = 'H1';
+        var touchNozzleName = 'N1';
+        var touchNozzleLabel = 'left nozzle N1';
+        var touchZ = 6.0;
+        var touchDwellMs = 250;
+        var dryRunFile = new File(projectDir, 'control/touch_dry_run.flag');
+        var dryRun = dryRunFile.exists();
+        var touchTool = findPickTool(touchHeadName, touchNozzleName);
+        var nozzle = touchTool.nozzle;
+        printNozzleLocations(touchTool.head);
+        var travelZ = nozzle.location.z;
+        var touchCorrection = readTouchCorrection();
+        var targets = readPickTargets(scanDir);
+
+        print('Touch sequence has ' + targets.length + ' unique target(s).');
+        print('Touch tool is ' + touchNozzleLabel + ' on head ' + touchHeadName
+            + '; travel Z for XY moves: ' + travelZ.toFixed(3)
+            + '; touch Z=' + touchZ.toFixed(3));
+        print('Touch correction: dX=' + touchCorrection.x.toFixed(3)
+            + ' dY=' + touchCorrection.y.toFixed(3)
+            + ' source=' + touchCorrection.source);
+        if (dryRun) {
+            print('Touch dry run flag is present: ' + dryRunFile.getAbsolutePath());
+        }
+        if (targets.length === 0) {
+            writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no touch targets found');
+            return;
+        }
+
+        for (var i = 0; i < targets.length; i++) {
+            if (!waitWhilePaused(pauseFile, stopFile, statusFile, scanId, i, targets.length)
+                    || haltRequested(stopFile, statusFile, scanId, i, targets.length)) {
+                print('Halt requested during touch sequence. Stopping before target ' + (i + 1) + '.');
+                return;
+            }
+
+            var target = targets[i];
+            var moveX = target.x + touchCorrection.x;
+            var moveY = target.y + touchCorrection.y;
+            writeStatus(
+                statusFile,
+                'touching',
+                scanId,
+                i + 1,
+                targets.length,
+                'Touching target at X ' + moveX.toFixed(3) + ', Y ' + moveY.toFixed(3)
+            );
+
+            debugTouchTarget(scanDir, target, nozzle, travelZ, dryRun, touchCorrection, moveX, moveY);
+            print('Moving ' + touchNozzleLabel + ' above object ' + target.objectIndex
+                + ' at X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
+                + ' travel Z=' + travelZ.toFixed(3));
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
+
+            if (dryRun) {
+                writeStatus(
+                    statusFile,
+                    'awaiting_calibration',
+                    scanId,
+                    i + 1,
+                    targets.length,
+                    'Jog N1 to the true target center, then click Record N1 Position'
+                );
+                showTouchCalibrationWindow(scanDir, statusFile, scanId, targets.length, target, nozzle, touchCorrection, moveX, moveY);
+                print('Touch dry run finished above target. Waiting for jog-and-record calibration.');
+                return;
+            }
+
+            print('Descending to touch object ' + target.objectIndex
+                + ' at X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
+                + ' Z=' + touchZ.toFixed(3));
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, touchZ);
+            Packages.java.lang.Thread.sleep(touchDwellMs);
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
+        }
+
+        writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan and touch sequence completed');
+    }
+
+    function readTouchCorrection() {
+        var calibrationFile = new File(projectDir, 'control/touch_calibration.jsonl');
+        var correction = {
+            x: 0.0,
+            y: 0.0,
+            z: -44.7,
+            source: 'none'
+        };
+
+        if (!calibrationFile.exists()) {
+            return correction;
+        }
+
+        var reader = new BufferedReader(new FileReader(calibrationFile));
+        try {
+            var line = reader.readLine();
+            while (line !== null) {
+                line = String(line).trim();
+                if (line.length > 0) {
+                    try {
+                        var record = JSON.parse(line);
+                        if (record.total_correction_x_mm !== undefined
+                                && record.total_correction_y_mm !== undefined) {
+                            correction.x = Number(record.total_correction_x_mm);
+                            correction.y = Number(record.total_correction_y_mm);
+                            if (record.recorded_z_mm !== undefined) {
+                                correction.z = Number(record.recorded_z_mm);
+                            }
+                            correction.source = 'total from ' + record.recorded_at;
+                        }
+                        else if (record.correction_x_mm !== undefined
+                                && record.correction_y_mm !== undefined) {
+                            correction.x = Number(record.correction_x_mm);
+                            correction.y = Number(record.correction_y_mm);
+                            if (record.recorded_z_mm !== undefined) {
+                                correction.z = Number(record.recorded_z_mm);
+                            }
+                            correction.source = 'legacy residual from ' + record.recorded_at;
+                        }
+                    }
+                    catch (parseError) {
+                        print('Skipping unreadable touch calibration record: ' + parseError);
+                    }
+                }
+                line = reader.readLine();
+            }
+        }
+        finally {
+            reader.close();
+        }
+        return correction;
+    }
+
+    function showTouchCalibrationWindow(scanDir, statusFile, scanId, totalTargets, target, nozzle, appliedCorrection, moveX, moveY) {
+        var calibrationFile = new File(projectDir, 'control/touch_calibration.jsonl');
+        var scanCalibrationFile = new File(scanDir, 'touch_calibration.jsonl');
+        var runnable = new Packages.java.lang.Runnable({
+            run: function() {
+                var JFrame = Packages.javax.swing.JFrame;
+                var JPanel = Packages.javax.swing.JPanel;
+                var JLabel = Packages.javax.swing.JLabel;
+                var JButton = Packages.javax.swing.JButton;
+                var ImageIcon = Packages.javax.swing.ImageIcon;
+                var BorderLayout = Packages.java.awt.BorderLayout;
+                var GridLayout = Packages.java.awt.GridLayout;
+                var FlowLayout = Packages.java.awt.FlowLayout;
+                var Image = Packages.java.awt.Image;
+                var EmptyBorder = Packages.javax.swing.border.EmptyBorder;
+                var ActionListener = Packages.java.awt.event.ActionListener;
+
+                var frame = new JFrame('Record N1 Touch Calibration');
+                frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+                frame.setAlwaysOnTop(true);
+
+                var panel = new JPanel(new BorderLayout(8, 8));
+                panel.setBorder(new EmptyBorder(12, 12, 12, 12));
+
+                var details = new JPanel(new GridLayout(0, 1, 2, 2));
+                details.add(new JLabel('Detected target: object ' + target.objectIndex));
+                details.add(new JLabel('Raw estimate X=' + target.x.toFixed(3) + ' Y=' + target.y.toFixed(3)));
+                details.add(new JLabel('Applied correction dX=' + appliedCorrection.x.toFixed(3)
+                    + ' dY=' + appliedCorrection.y.toFixed(3)));
+                details.add(new JLabel('Commanded N1 X=' + moveX.toFixed(3) + ' Y=' + moveY.toFixed(3)));
+                details.add(new JLabel('Jog N1 to the true target center, then record.'));
+                details.add(new JLabel('Writes: ' + calibrationFile.getAbsolutePath()));
+                panel.add(details, BorderLayout.CENTER);
+
+                var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+                var recordButton = new JButton('Record N1 Position');
+                var closeButton = new JButton('Close');
+                buttons.add(closeButton);
+                buttons.add(recordButton);
+                panel.add(buttons, BorderLayout.SOUTH);
+
+                recordButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        var recorded = nozzle.location;
+                        var record = {
+                            scan_id: scanId,
+                            scan_dir: scanDir.getAbsolutePath(),
+                            object_index: target.objectIndex,
+                            raw_commanded_x_mm: target.x,
+                            raw_commanded_y_mm: target.y,
+                            applied_correction_x_mm: appliedCorrection.x,
+                            applied_correction_y_mm: appliedCorrection.y,
+                            commanded_x_mm: moveX,
+                            commanded_y_mm: moveY,
+                            recorded_x_mm: recorded.x,
+                            recorded_y_mm: recorded.y,
+                            recorded_z_mm: recorded.z,
+                            recorded_rotation: recorded.rotation,
+                            residual_correction_x_mm: recorded.x - moveX,
+                            residual_correction_y_mm: recorded.y - moveY,
+                            total_correction_x_mm: appliedCorrection.x + (recorded.x - moveX),
+                            total_correction_y_mm: appliedCorrection.y + (recorded.y - moveY),
+                            correction_x_mm: recorded.x - moveX,
+                            correction_y_mm: recorded.y - moveY,
+                            raw_estimate_x_mm: target.estimatedX,
+                            raw_estimate_y_mm: target.estimatedY,
+                            requested_frame_estimated_x_mm: target.requestedEstimateX,
+                            requested_frame_estimated_y_mm: target.requestedEstimateY,
+                            frame_x_mm: target.frameX,
+                            frame_y_mm: target.frameY,
+                            frame_requested_x_mm: target.requestedFrameX,
+                            frame_requested_y_mm: target.requestedFrameY,
+                            recorded_at: new Date().toISOString()
+                        };
+                        var line = JSON.stringify(record) + '\n';
+                        appendText(calibrationFile, line);
+                        appendText(scanCalibrationFile, line);
+                        writeStatus(
+                            statusFile,
+                            'completed',
+                            scanId,
+                            1,
+                            totalTargets,
+                            'Recorded N1 total touch correction: dX '
+                                + record.total_correction_x_mm.toFixed(3)
+                                + ', dY '
+                                + record.total_correction_y_mm.toFixed(3)
+                        );
+                        print('Recorded N1 touch calibration: ' + line);
+                        frame.dispose();
+                    }
+                }));
+
+                closeButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        frame.dispose();
+                    }
+                }));
+
+                frame.setContentPane(panel);
+                frame.pack();
+                frame.setLocationRelativeTo(null);
+                frame.setVisible(true);
+            }
+        });
+        Packages.javax.swing.SwingUtilities.invokeLater(runnable);
+    }
+
+    function interactiveReviewTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames) {
+        var state = makeInteractiveReviewState(scanDir);
+        var targets = readPickTargets(scanDir);
+
+        print('Interactive pick review has ' + targets.length + ' unique target(s).');
+        print('Interactive correction starts at dX=' + state.touchCorrection.x.toFixed(3)
+            + ' dY=' + state.touchCorrection.y.toFixed(3)
+            + ' source=' + state.touchCorrection.source);
+        if (targets.length === 0) {
+            writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no interactive targets found');
+            return;
+        }
+
+        while (state.reviewedCount < targets.length) {
+            if (!interactiveReviewNextAvailableTarget(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, state)) {
+                return;
+            }
+            targets = readPickTargets(scanDir);
+        }
+
+        writeStatus(statusFile, 'completed', scanId, targets.length, targets.length, 'Interactive target review completed');
+    }
+
+    function makeInteractiveReviewState(scanDir) {
+        return {
+            headName: 'H1',
+            nozzleName: 'N1',
+            reviewedCount: 0,
+            touchCorrection: readTouchCorrection(),
+            reviewFile: new File(projectDir, 'control/interactive_pick_review.jsonl'),
+            scanReviewFile: new File(scanDir, 'interactive_pick_review.jsonl')
+        };
+    }
+
+    function interactiveReviewNextAvailableTarget(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames, state) {
+        var targets = readPickTargets(scanDir, true);
+        if (state.reviewedCount >= targets.length) {
+            return true;
+        }
+
+        var targetIndex = state.reviewedCount;
+        var target = targets[targetIndex];
+        while (true) {
+            if (!waitWhilePaused(pauseFile, stopFile, statusFile, scanId, targetIndex, targets.length)
+                    || haltRequested(stopFile, statusFile, scanId, targetIndex, targets.length)) {
+                print('Halt requested during interactive review. Stopping before target ' + (targetIndex + 1) + '.');
+                return false;
+            }
+
+            var pickTool = findPickTool(state.headName, state.nozzleName);
+            var nozzle = pickTool.nozzle;
+            var travelZ = nozzle.location.z;
+            var moveX = target.x + state.touchCorrection.x;
+            var moveY = target.y + state.touchCorrection.y;
+            var reviewZ = state.touchCorrection.z;
+
+            writeStatus(
+                statusFile,
+                'awaiting_feedback',
+                scanId,
+                targetIndex + 1,
+                targets.length,
+                'Review target ' + (targetIndex + 1) + ' with nozzle ' + state.nozzleName
+            );
+            print('Interactive review target ' + (targetIndex + 1) + '/' + targets.length
+                + ' object=' + target.objectIndex
+                + ' nozzle=' + state.nozzleName
+                + ' corrected X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
+                + ' review Z=' + reviewZ.toFixed(3)
+                + ' travel Z=' + travelZ.toFixed(3));
+
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, reviewZ);
+
+            var feedback = showInteractiveReviewWindow(
+                scanDir,
+                scanId,
+                targetIndex,
+                targets.length,
+                target,
+                nozzle,
+                state.nozzleName,
+                state.touchCorrection,
+                moveX,
+                moveY,
+                reviewZ
+            );
+            var recorded = nozzle.location;
+            moveNozzleToXyAtZ(nozzle, recorded.x, recorded.y, travelZ);
+
+            if (feedback.action === 'stop') {
+                writeStatus(statusFile, 'halted', scanId, targetIndex + 1, targets.length, 'Interactive review stopped by user');
+                return false;
+            }
+            if (feedback.action === 'switch') {
+                parkNozzlesForScan(pickTool.head);
+                state.nozzleName = state.nozzleName === 'N1' ? 'N2' : 'N1';
+                print('Interactive review parked nozzles, switched configured nozzle to '
+                    + state.nozzleName
+                    + ', and will retry current target.');
+                continue;
+            }
+            if (feedback.action === 'skip') {
+                appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, state.nozzleName, 'skip', state.touchCorrection, moveX, moveY, recorded, null);
+                state.reviewedCount++;
+                parkNozzlesForScan(pickTool.head);
+                return true;
+            }
+            if (feedback.action === 'save') {
+                var residualX = recorded.x - moveX;
+                var residualY = recorded.y - moveY;
+                state.touchCorrection = {
+                    x: state.touchCorrection.x + residualX,
+                    y: state.touchCorrection.y + residualY,
+                    z: recorded.z,
+                    source: 'interactive save target ' + target.objectIndex
+                };
+                appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, state.nozzleName, 'save', state.touchCorrection, moveX, moveY, recorded, {
+                    residualX: residualX,
+                    residualY: residualY
+                });
+                appendTouchCorrectionRecord(scanDir, scanId, target, state.touchCorrection, moveX, moveY, recorded, residualX, residualY);
+                state.reviewedCount++;
+                parkNozzlesForScan(pickTool.head);
+                return true;
+            }
+
+            appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, state.nozzleName, 'correct', state.touchCorrection, moveX, moveY, recorded, null);
+            state.reviewedCount++;
+            parkNozzlesForScan(pickTool.head);
+            return true;
+        }
+    }
+
+    function showInteractiveReviewWindow(scanDir, scanId, targetIndex, totalTargets, target, nozzle, nozzleName, correction, moveX, moveY, reviewZ) {
+        var queue = new Packages.java.util.concurrent.ArrayBlockingQueue(1);
+        var runnable = new Packages.java.lang.Runnable({
+            run: function() {
+                var JFrame = Packages.javax.swing.JFrame;
+                var JPanel = Packages.javax.swing.JPanel;
+                var JLabel = Packages.javax.swing.JLabel;
+                var JButton = Packages.javax.swing.JButton;
+                var ImageIcon = Packages.javax.swing.ImageIcon;
+                var BorderLayout = Packages.java.awt.BorderLayout;
+                var GridLayout = Packages.java.awt.GridLayout;
+                var FlowLayout = Packages.java.awt.FlowLayout;
+                var Image = Packages.java.awt.Image;
+                var EmptyBorder = Packages.javax.swing.border.EmptyBorder;
+                var ActionListener = Packages.java.awt.event.ActionListener;
+
+                var frame = new JFrame('Interactive Pick Review');
+                frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+                frame.setAlwaysOnTop(true);
+
+                var panel = new JPanel(new BorderLayout(8, 8));
+                panel.setBorder(new EmptyBorder(12, 12, 12, 12));
+
+                var details = new JPanel(new GridLayout(0, 1, 2, 2));
+                details.add(new JLabel('Target ' + (targetIndex + 1) + ' of ' + totalTargets + ' (object ' + target.objectIndex + ')'));
+                details.add(new JLabel('Current nozzle: ' + nozzleName));
+                details.add(new JLabel('Commanded X=' + moveX.toFixed(3) + ' Y=' + moveY.toFixed(3) + ' Z=' + reviewZ.toFixed(3)));
+                details.add(new JLabel('Correction dX=' + correction.x.toFixed(3) + ' dY=' + correction.y.toFixed(3)));
+                details.add(new JLabel('Jog if needed, then choose feedback.'));
+                panel.add(details, BorderLayout.CENTER);
+
+                var imageLabel = makeTargetImageLabel(scanDir, target, ImageIcon, JLabel, Image);
+                if (imageLabel !== null) {
+                    panel.add(imageLabel, BorderLayout.NORTH);
+                }
+
+                var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+                var stopButton = new JButton('Stop');
+                var skipButton = new JButton('Skip');
+                var switchButton = new JButton('Switch Nozzle');
+                var saveButton = new JButton('Save Jogged Position');
+                var correctButton = new JButton('Correct');
+                buttons.add(stopButton);
+                buttons.add(skipButton);
+                buttons.add(switchButton);
+                buttons.add(saveButton);
+                buttons.add(correctButton);
+                panel.add(buttons, BorderLayout.SOUTH);
+
+                function choose(action) {
+                    queue.offer(JSON.stringify({ action: action }));
+                    frame.dispose();
+                }
+
+                correctButton.addActionListener(new ActionListener({ actionPerformed: function(event) { choose('correct'); } }));
+                saveButton.addActionListener(new ActionListener({ actionPerformed: function(event) { choose('save'); } }));
+                switchButton.addActionListener(new ActionListener({ actionPerformed: function(event) { choose('switch'); } }));
+                skipButton.addActionListener(new ActionListener({ actionPerformed: function(event) { choose('skip'); } }));
+                stopButton.addActionListener(new ActionListener({ actionPerformed: function(event) { choose('stop'); } }));
+
+                frame.setContentPane(panel);
+                frame.pack();
+                frame.setLocationRelativeTo(null);
+                frame.setVisible(true);
+            }
+        });
+
+        Packages.javax.swing.SwingUtilities.invokeLater(runnable);
+        return JSON.parse(String(queue.take()));
+    }
+
+    function showInteractiveReviewWindowAsync(scanDir, statusFile, scanId, targetIndex, totalTargets, target, initialNozzle, state, moveX, moveY, reviewZ) {
+        var runnable = new Packages.java.lang.Runnable({
+            run: function() {
+                var JFrame = Packages.javax.swing.JFrame;
+                var JPanel = Packages.javax.swing.JPanel;
+                var JLabel = Packages.javax.swing.JLabel;
+                var JButton = Packages.javax.swing.JButton;
+                var ImageIcon = Packages.javax.swing.ImageIcon;
+                var BorderLayout = Packages.java.awt.BorderLayout;
+                var GridLayout = Packages.java.awt.GridLayout;
+                var FlowLayout = Packages.java.awt.FlowLayout;
+                var Image = Packages.java.awt.Image;
+                var EmptyBorder = Packages.javax.swing.border.EmptyBorder;
+                var ActionListener = Packages.java.awt.event.ActionListener;
+                var UiUtils = Packages.org.openpnp.util.UiUtils;
+
+                var currentNozzle = initialNozzle;
+                var currentNozzleName = state.nozzleName;
+                var currentMoveX = moveX;
+                var currentMoveY = moveY;
+                var currentReviewZ = reviewZ;
+
+                var frame = new JFrame('Interactive Pick Review');
+                frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+                frame.setAlwaysOnTop(true);
+
+                var panel = new JPanel(new BorderLayout(8, 8));
+                panel.setBorder(new EmptyBorder(12, 12, 12, 12));
+
+                var details = new JPanel(new GridLayout(0, 1, 2, 2));
+                var nozzleLabel = new JLabel('');
+                var commandLabel = new JLabel('');
+                details.add(new JLabel('Target ' + (targetIndex + 1) + ' of ' + totalTargets + ' (object ' + target.objectIndex + ')'));
+                details.add(nozzleLabel);
+                details.add(commandLabel);
+                details.add(new JLabel('Correction dX=' + state.touchCorrection.x.toFixed(3)
+                    + ' dY=' + state.touchCorrection.y.toFixed(3)
+                    + ' Z=' + state.touchCorrection.z.toFixed(3)));
+                details.add(new JLabel('Jog if needed, then choose feedback.'));
+                panel.add(details, BorderLayout.CENTER);
+
+                var imageLabel = makeTargetImageLabel(scanDir, target, ImageIcon, JLabel, Image);
+                if (imageLabel !== null) {
+                    panel.add(imageLabel, BorderLayout.NORTH);
+                }
+
+                var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+                var stopButton = new JButton('Stop');
+                var skipButton = new JButton('Skip');
+                var switchButton = new JButton('Switch Nozzle');
+                var saveButton = new JButton('Save Jogged Position');
+                var correctButton = new JButton('Correct');
+                buttons.add(stopButton);
+                buttons.add(skipButton);
+                buttons.add(switchButton);
+                buttons.add(saveButton);
+                buttons.add(correctButton);
+                panel.add(buttons, BorderLayout.SOUTH);
+
+                function refreshLabels() {
+                    nozzleLabel.setText('Current configured nozzle: ' + currentNozzleName);
+                    commandLabel.setText('Commanded X=' + currentMoveX.toFixed(3)
+                        + ' Y=' + currentMoveY.toFixed(3)
+                        + ' Z=' + currentReviewZ.toFixed(3));
+                }
+
+                function finish(action, saveCorrection) {
+                    var recorded = currentNozzle.location;
+                    var residual = null;
+                    if (saveCorrection) {
+                        var residualX = recorded.x - currentMoveX;
+                        var residualY = recorded.y - currentMoveY;
+                        residual = {
+                            residualX: residualX,
+                            residualY: residualY
+                        };
+                        state.touchCorrection = {
+                            x: state.touchCorrection.x + residualX,
+                            y: state.touchCorrection.y + residualY,
+                            z: recorded.z,
+                            source: 'interactive save target ' + target.objectIndex
+                        };
+                        appendTouchCorrectionRecord(scanDir, scanId, target, state.touchCorrection, currentMoveX, currentMoveY, recorded, residualX, residualY);
+                    }
+                    appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, currentNozzleName, action, state.touchCorrection, currentMoveX, currentMoveY, recorded, residual);
+                    writeStatus(statusFile, 'completed', scanId, targetIndex + 1, totalTargets, 'Interactive target review recorded: ' + action);
+                    frame.dispose();
+                }
+
+                correctButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        finish('correct', false);
+                    }
+                }));
+                saveButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        finish('save', true);
+                    }
+                }));
+                skipButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        finish('skip', false);
+                    }
+                }));
+                stopButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        writeStatus(statusFile, 'halted', scanId, targetIndex + 1, totalTargets, 'Interactive review stopped by user');
+                        frame.dispose();
+                    }
+                }));
+                switchButton.addActionListener(new ActionListener({
+                    actionPerformed: function(event) {
+                        UiUtils['submitUiMachineTask(Thrunnable)'](function() {
+                            parkNozzlesForScan(machine.defaultHead);
+                            currentNozzleName = currentNozzleName === 'N1' ? 'N2' : 'N1';
+                            state.nozzleName = currentNozzleName;
+                            var pickTool = findPickTool(state.headName, currentNozzleName);
+                            currentNozzle = pickTool.nozzle;
+                            var travelZ = currentNozzle.location.z;
+                            moveNozzleToXyAtZ(currentNozzle, currentMoveX, currentMoveY, travelZ);
+                            moveNozzleToXyAtZ(currentNozzle, currentMoveX, currentMoveY, currentReviewZ);
+                            Packages.javax.swing.SwingUtilities.invokeLater(new Packages.java.lang.Runnable({
+                                run: function() {
+                                    refreshLabels();
+                                }
+                            }));
+                        });
+                    }
+                }));
+
+                refreshLabels();
+                frame.setContentPane(panel);
+                frame.pack();
+                frame.setLocationRelativeTo(null);
+                frame.setVisible(true);
+            }
+        });
+        Packages.javax.swing.SwingUtilities.invokeLater(runnable);
+    }
+
+    function makeTargetImageLabel(scanDir, target, ImageIcon, JLabel, Image) {
+        var relativePath = target.overlayFile && target.overlayFile.length > 0
+            ? target.overlayFile
+            : target.sourceFile && target.sourceFile.length > 0
+            ? target.sourceFile
+            : target.cropFile;
+        if (!relativePath || relativePath.length === 0) {
+            return null;
+        }
+
+        var imageFile = new File(scanDir, relativePath);
+        if (!imageFile.exists()) {
+            return null;
+        }
+
+        var icon = new ImageIcon(imageFile.getAbsolutePath());
+        var image = icon.getImage();
+        var width = icon.getIconWidth();
+        var height = icon.getIconHeight();
+        var maxWidth = 720;
+        var maxHeight = 420;
+        if (width > maxWidth || height > maxHeight) {
+            var scale = Math.min(maxWidth / width, maxHeight / height);
+            image = image.getScaledInstance(
+                Math.max(1, Math.round(width * scale)),
+                Math.max(1, Math.round(height * scale)),
+                Image.SCALE_SMOOTH
+            );
+            icon = new ImageIcon(image);
+        }
+
+        var label = new JLabel(icon);
+        return label;
+    }
+
+    function appendInteractiveReviewRecord(reviewFile, scanReviewFile, scanId, scanDir, target, nozzleName, action, correction, moveX, moveY, recorded, residual) {
+        var record = {
+            scan_id: scanId,
+            scan_dir: scanDir.getAbsolutePath(),
+            object_index: target.objectIndex,
+            action: action,
+            nozzle_name: nozzleName,
+            raw_x_mm: target.x,
+            raw_y_mm: target.y,
+            commanded_x_mm: moveX,
+            commanded_y_mm: moveY,
+            recorded_x_mm: recorded.x,
+            recorded_y_mm: recorded.y,
+            recorded_z_mm: recorded.z,
+            applied_correction_x_mm: correction.x,
+            applied_correction_y_mm: correction.y,
+            residual_correction_x_mm: residual === null ? null : residual.residualX,
+            residual_correction_y_mm: residual === null ? null : residual.residualY,
+            recorded_at: new Date().toISOString()
+        };
+        var line = JSON.stringify(record) + '\n';
+        appendText(reviewFile, line);
+        appendText(scanReviewFile, line);
+        print('Interactive review record: ' + line);
+    }
+
+    function appendTouchCorrectionRecord(scanDir, scanId, target, totalCorrection, moveX, moveY, recorded, residualX, residualY) {
+        var calibrationFile = new File(projectDir, 'control/touch_calibration.jsonl');
+        var scanCalibrationFile = new File(scanDir, 'touch_calibration.jsonl');
+        var record = {
+            scan_id: scanId,
+            scan_dir: scanDir.getAbsolutePath(),
+            object_index: target.objectIndex,
+            raw_commanded_x_mm: target.x,
+            raw_commanded_y_mm: target.y,
+            commanded_x_mm: moveX,
+            commanded_y_mm: moveY,
+            recorded_x_mm: recorded.x,
+            recorded_y_mm: recorded.y,
+            recorded_z_mm: recorded.z,
+            residual_correction_x_mm: residualX,
+            residual_correction_y_mm: residualY,
+            total_correction_x_mm: totalCorrection.x,
+            total_correction_y_mm: totalCorrection.y,
+            correction_x_mm: residualX,
+            correction_y_mm: residualY,
+            recorded_at: new Date().toISOString()
+        };
+        var line = JSON.stringify(record) + '\n';
+        appendText(calibrationFile, line);
+        appendText(scanCalibrationFile, line);
+        print('Updated touch calibration from interactive review: ' + line);
+    }
+
+    function debugTouchTarget(scanDir, target, nozzle, travelZ, dryRun, touchCorrection, moveX, moveY) {
+        print('Touch coordinate debug for object ' + target.objectIndex + ':'
+            + ' scan=' + scanDir.getName()
+            + ' chosen X=' + target.x.toFixed(3)
+            + ' Y=' + target.y.toFixed(3)
+            + ' corrected-command X=' + moveX.toFixed(3)
+            + ' Y=' + moveY.toFixed(3)
+            + ' correction X=' + touchCorrection.x.toFixed(3)
+            + ' Y=' + touchCorrection.y.toFixed(3)
+            + ' raw-estimate X=' + target.estimatedX.toFixed(3)
+            + ' Y=' + target.estimatedY.toFixed(3)
+            + ' requested-frame estimate X=' + target.requestedEstimateX.toFixed(3)
+            + ' Y=' + target.requestedEstimateY.toFixed(3)
+            + ' frame camera X=' + target.frameX.toFixed(3)
+            + ' Y=' + target.frameY.toFixed(3)
+            + ' frame requested X=' + target.requestedFrameX.toFixed(3)
+            + ' Y=' + target.requestedFrameY.toFixed(3)
+            + ' current nozzle=' + formatLocation(nozzle.location)
+            + ' travel Z=' + travelZ.toFixed(3)
+            + ' dry_run=' + dryRun);
     }
 
     function findHeadByName(headName) {
@@ -251,6 +967,69 @@ with (imports) {
         };
     }
 
+    function printNozzleLocations(head) {
+        try {
+            var nozzles = head.getNozzles();
+            for (var i = 0; i < nozzles.size(); i++) {
+                var nozzle = nozzles.get(i);
+                print('Nozzle state: ' + nozzle.getName() + ' location=' + formatLocation(nozzle.location));
+            }
+        }
+        catch (error) {
+            print('Could not enumerate nozzle states: ' + error);
+        }
+    }
+
+    function parkNozzlesForScan(head) {
+        print('Parking nozzles before scan XY motion.');
+        printNozzleLocations(head);
+        try {
+            var nozzles = head.getNozzles();
+            for (var i = 0; i < nozzles.size(); i++) {
+                parkNozzle(nozzles.get(i));
+            }
+        }
+        catch (error) {
+            print('Could not enumerate nozzles for parking: ' + error);
+            try {
+                parkNozzle(head.defaultNozzle);
+            }
+            catch (defaultError) {
+                print('Could not park default nozzle: ' + defaultError);
+            }
+        }
+        print('Nozzle states after parking:');
+        printNozzleLocations(head);
+    }
+
+    function parkNozzle(nozzle) {
+        try {
+            nozzle.moveToSafeZ();
+            print('Parked nozzle with OpenPnP safe Z: ' + nozzle.getName()
+                + ' location=' + formatLocation(nozzle.location));
+            return;
+        }
+        catch (safeZError) {
+            print('OpenPnP safe Z park failed for ' + nozzle.getName()
+                + '; using fallback park Z: ' + safeZError);
+        }
+
+        var parkZ = fallbackParkZForNozzle(nozzle);
+        moveNozzleToXyAtZ(nozzle, nozzle.location.x, nozzle.location.y, parkZ);
+        print('Parked nozzle with fallback Z: ' + nozzle.getName()
+            + ' location=' + formatLocation(nozzle.location));
+    }
+
+    function fallbackParkZForNozzle(nozzle) {
+        if (nozzle.getName() === 'N1') {
+            return -15.3;
+        }
+        if (nozzle.getName() === 'N2') {
+            return 26.5;
+        }
+        return nozzle.location.z;
+    }
+
     function findVacuumActuator(head, nozzle) {
         var actuatorName = 'VAC1';
 
@@ -283,6 +1062,21 @@ with (imports) {
         Packages.java.lang.Thread.sleep(200);
     }
 
+    function n2ZWhenN1Z(n1Z) {
+        return 11.2 - n1Z;
+    }
+
+    function warnDualNozzleZClearance(n1Z, context) {
+        var predictedN2Z = n2ZWhenN1Z(n1Z);
+        print('Dual-nozzle Z check before ' + context
+            + ': commanded N1 Z=' + n1Z.toFixed(3)
+            + ' predicts N2 Z=' + predictedN2Z.toFixed(3));
+        if (predictedN2Z < 20.0) {
+            print('Warning: predicted N2 Z is near the work surface. '
+                + 'Continuing because N1 was manually verified as the intended pick nozzle.');
+        }
+    }
+
     function nozzleLocationAt(nozzle, x, y, z) {
         return new Location(
             LengthUnit.Millimeters,
@@ -297,11 +1091,15 @@ with (imports) {
         nozzle.moveTo(nozzleLocationAt(nozzle, x, y, z));
     }
 
-    function debugPickTarget(scanDir, target, nozzle, travelZ, dryRun) {
+    function debugPickTarget(scanDir, target, nozzle, travelZ, dryRun, touchCorrection, moveX, moveY) {
         print('Pick coordinate debug for object ' + target.objectIndex + ':'
             + ' scan=' + scanDir.getName()
-            + ' pick X=' + target.x.toFixed(3)
+            + ' raw pick X=' + target.x.toFixed(3)
             + ' Y=' + target.y.toFixed(3)
+            + ' corrected pick X=' + moveX.toFixed(3)
+            + ' Y=' + moveY.toFixed(3)
+            + ' correction X=' + touchCorrection.x.toFixed(3)
+            + ' Y=' + touchCorrection.y.toFixed(3)
             + ' frame X=' + target.frameX.toFixed(3)
             + ' Y=' + target.frameY.toFixed(3)
             + ' requested-frame estimate X=' + target.requestedEstimateX.toFixed(3)
@@ -310,7 +1108,7 @@ with (imports) {
             + ' dry_run=' + dryRun);
         if (dryRun) {
             print('Dry run active: moving above first pick target only. Create/remove control/pick_dry_run.flag to toggle.');
-            moveNozzleToXyAtZ(nozzle, target.x, target.y, travelZ);
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
             print('Dry run finished above target. No Z descent, no vacuum, no drop move.');
         }
     }
@@ -328,11 +1126,24 @@ with (imports) {
         return true;
     }
 
-    function readPickTargets(scanDir) {
+    function waitForTargetCount(scanDir, minimumTargets, timeoutMs) {
+        var start = new Date().getTime();
+        while ((new Date().getTime() - start) <= timeoutMs) {
+            if (readPickTargets(scanDir, true).length >= minimumTargets) {
+                return true;
+            }
+            Packages.java.lang.Thread.sleep(250);
+        }
+        return false;
+    }
+
+    function readPickTargets(scanDir, quiet) {
         var objectsFile = new File(scanDir, 'objects.jsonl');
         var targets = [];
         if (!objectsFile.exists()) {
-            print('No objects.jsonl found for pick sequence: ' + objectsFile.getAbsolutePath());
+            if (!quiet) {
+                print('No objects.jsonl found for pick sequence: ' + objectsFile.getAbsolutePath());
+            }
             return targets;
         }
 
@@ -351,12 +1162,17 @@ with (imports) {
                                 objectIndex: record.object_index,
                                 x: Number(pickX),
                                 y: Number(pickY),
+                                estimatedX: Number(record.estimated_x_mm),
+                                estimatedY: Number(record.estimated_y_mm),
                                 frameX: Number(record.frame_x_mm),
                                 frameY: Number(record.frame_y_mm),
                                 requestedFrameX: Number(record.frame_requested_x_mm),
                                 requestedFrameY: Number(record.frame_requested_y_mm),
                                 requestedEstimateX: Number(record.requested_frame_estimated_x_mm),
                                 requestedEstimateY: Number(record.requested_frame_estimated_y_mm),
+                                cropFile: String(record.crop_file || ''),
+                                overlayFile: String(record.overlay_file || ''),
+                                sourceFile: String(record.source_file || ''),
                                 score: Number(record.score || 0)
                             });
                         }
@@ -408,21 +1224,27 @@ with (imports) {
         var pickHeadName = 'H1';
         var pickNozzleName = 'N1';
         var pickNozzleLabel = 'left nozzle N1';
-        var pickZ = 6.0;
         var dropX = 100.0;
         var dropY = 200.0;
-        var dropZ = 6.0;
-        var dryRunFile = new File('/home/sean/Documents/OpenInvert-PnP/control/pick_dry_run.flag');
+        var dryRunFile = new File(projectDir, 'control/pick_dry_run.flag');
         var dryRun = dryRunFile.exists();
         var pickTool = findPickTool(pickHeadName, pickNozzleName);
         var nozzle = pickTool.nozzle;
         var vacuumActuator = findVacuumActuator(pickTool.head, nozzle);
         var travelZ = nozzle.location.z;
+        var touchCorrection = readTouchCorrection();
+        var pickZ = touchCorrection.z;
+        var dropZ = touchCorrection.z;
         var targets = readPickTargets(scanDir);
 
         print('Pick sequence has ' + targets.length + ' unique target(s).');
         print('Pick tool is ' + pickNozzleLabel + ' on head ' + pickHeadName
             + '; travel Z for XY moves: ' + travelZ.toFixed(3));
+        print('Pick correction: dX=' + touchCorrection.x.toFixed(3)
+            + ' dY=' + touchCorrection.y.toFixed(3)
+            + ' source=' + touchCorrection.source);
+        print('Dual-nozzle Z prediction: N1 pick Z=' + pickZ.toFixed(3)
+            + ' would put N2 at Z=' + n2ZWhenN1Z(pickZ).toFixed(3));
         if (dryRun) {
             print('Pick dry run flag is present: ' + dryRunFile.getAbsolutePath());
         }
@@ -439,34 +1261,37 @@ with (imports) {
             }
 
             var target = targets[i];
+            var moveX = target.x + touchCorrection.x;
+            var moveY = target.y + touchCorrection.y;
             writeStatus(
                 statusFile,
                 'picking',
                 scanId,
                 i + 1,
                 targets.length,
-                'Picking target at X ' + target.x.toFixed(3) + ', Y ' + target.y.toFixed(3)
+                'Picking target at X ' + moveX.toFixed(3) + ', Y ' + moveY.toFixed(3)
             );
 
-            debugPickTarget(scanDir, target, nozzle, travelZ, dryRun);
+            debugPickTarget(scanDir, target, nozzle, travelZ, dryRun, touchCorrection, moveX, moveY);
             if (dryRun) {
                 writeStatus(statusFile, 'paused', scanId, i + 1, targets.length, 'Dry run stopped above first pick target');
                 return;
             }
 
             print('Moving ' + pickNozzleLabel + ' above object ' + target.objectIndex
-                + ' using recorded scan coordinates X=' + target.x.toFixed(3)
-                + ' Y=' + target.y.toFixed(3)
+                + ' using corrected scan coordinates X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
                 + ' at travel Z=' + travelZ.toFixed(3));
-            moveNozzleToXyAtZ(nozzle, target.x, target.y, travelZ);
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
             print('Descending to pick object ' + target.objectIndex
-                + ' at X=' + target.x.toFixed(3)
-                + ' Y=' + target.y.toFixed(3)
+                + ' at X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
                 + ' Z=' + pickZ.toFixed(3));
-            moveNozzleToXyAtZ(nozzle, target.x, target.y, pickZ);
+            warnDualNozzleZClearance(pickZ, 'pick descent');
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, pickZ);
             setVacuum(vacuumActuator, true);
-            moveNozzleToXyAtZ(nozzle, target.x, target.y, travelZ);
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
             print('Moving ' + pickNozzleLabel + ' above drop location for object ' + target.objectIndex
                 + ' at X=' + dropX.toFixed(3)
@@ -478,6 +1303,7 @@ with (imports) {
                 + ' at X=' + dropX.toFixed(3)
                 + ' Y=' + dropY.toFixed(3)
                 + ' Z=' + dropZ.toFixed(3));
+            warnDualNozzleZClearance(dropZ, 'drop descent');
             moveNozzleToXyAtZ(nozzle, dropX, dropY, dropZ);
             setVacuum(vacuumActuator, false);
             moveNozzleToXyAtZ(nozzle, dropX, dropY, travelZ);
@@ -491,6 +1317,7 @@ with (imports) {
         if (camera.getName() !== 'Top') {
             camera = machine.getCameraByName('Top');
         }
+        parkNozzlesForScan(machine.defaultHead);
 
         var xLeft = 361.0;
         var xRight = 411.0;
@@ -502,13 +1329,15 @@ with (imports) {
         var xStepMm = 12.0;
         var yStepMm = 9.5;
 
-        var controlDir = new File('/home/sean/Documents/OpenInvert-PnP/control');
+        var controlDir = new File(projectDir, 'control');
         var pauseFile = new File(controlDir, 'pause.flag');
         var stopFile = new File(controlDir, 'stop.flag');
         var pickDryRunFile = new File(controlDir, 'pick_dry_run.flag');
+        var touchDryRunFile = new File(controlDir, 'touch_dry_run.flag');
+        var interactivePickFile = new File(controlDir, 'interactive_pick.flag');
         var statusFile = new File(controlDir, 'scan_status.json');
         var detectionStatusFile = new File(controlDir, 'detection_status.json');
-        var outputRoot = new File('/home/sean/Documents/OpenInvert-PnP/scans');
+        var outputRoot = new File(projectDir, 'scans');
         var scanId = 'scan_' + timestamp();
         controlDir.mkdirs();
         if (stopFile.exists()) {
@@ -526,23 +1355,35 @@ with (imports) {
         var ys = positions(yTop, yBottom, yStepMm, false);
         var frameIndex = 0;
         var totalFrames = xs.length * ys.length;
+        var stopAtFirstTarget = touchDryRunFile.exists() && !interactivePickFile.exists();
+        var stopAfterFirstTarget = false;
+        var interactiveState = interactivePickFile.exists() ? makeInteractiveReviewState(scanDir) : null;
 
         print('Starting Top camera scan: ' + scanId);
         print('Frames directory: ' + framesDir.getAbsolutePath());
         print('Grid: ' + xs.length + ' columns x ' + ys.length + ' rows');
+        print('Stop at first detected target: ' + stopAtFirstTarget);
         print('Camera X compensation: ' + cameraXOffsetMm.toFixed(3) + ' mm');
         print('Camera Y compensation: +' + cameraYOffsetMm.toFixed(3) + ' mm');
         print('Cooperative pause flag: ' + pauseFile.getAbsolutePath());
         print('Cooperative halt flag: ' + stopFile.getAbsolutePath());
         print('Pick dry run flag: ' + pickDryRunFile.getAbsolutePath()
             + ' exists=' + pickDryRunFile.exists());
+        print('Touch dry run flag: ' + touchDryRunFile.getAbsolutePath()
+            + ' exists=' + touchDryRunFile.exists());
+        print('Interactive pick flag: ' + interactivePickFile.getAbsolutePath()
+            + ' exists=' + interactivePickFile.exists());
         writeStatus(
             statusFile,
             'running',
             scanId,
             frameIndex,
             totalFrames,
-            pickDryRunFile.exists() ? 'Scan started with pick dry run enabled' : 'Scan started'
+            interactivePickFile.exists()
+                ? 'Scan started with interactive pick review enabled'
+                : touchDryRunFile.exists()
+                ? 'Scan started with touch dry run enabled'
+                : 'Scan started'
         );
         writeText(detectionStatusFile, JSON.stringify({
             status: 'scan_running',
@@ -617,6 +1458,45 @@ with (imports) {
                     print('Captured ' + fileName);
                     frameIndex++;
                     writeStatus(statusFile, 'running', scanId, frameIndex, totalFrames, 'Captured ' + fileName);
+
+                    if (stopAtFirstTarget && waitForTargetCount(scanDir, 1, 2500)) {
+                        stopAfterFirstTarget = true;
+                        print('First target detected after frame ' + (frameIndex - 1)
+                            + '. Stopping scan early for touch dry-run diagnosis.');
+                        writeStatus(
+                            statusFile,
+                            'scan_complete',
+                            scanId,
+                            frameIndex,
+                            frameIndex,
+                            'First target detected; stopping scan early for touch dry run'
+                        );
+                        break;
+                    }
+
+                    if (interactiveState !== null) {
+                        while (waitForTargetCount(scanDir, interactiveState.reviewedCount + 1, 250)) {
+                            print('New interactive target available after frame ' + (frameIndex - 1)
+                                + '. Pausing scan for review.');
+                            if (!interactiveReviewNextAvailableTarget(
+                                    scanDir,
+                                    pauseFile,
+                                    stopFile,
+                                    statusFile,
+                                    scanId,
+                                    totalFrames,
+                                    interactiveState
+                            )) {
+                                halted = true;
+                                return;
+                            }
+                            writeStatus(statusFile, 'running', scanId, frameIndex, totalFrames, 'Resuming scan after interactive target review');
+                        }
+                    }
+                }
+
+                if (stopAfterFirstTarget) {
+                    break;
                 }
             }
         }
@@ -625,11 +1505,36 @@ with (imports) {
         }
 
         if (!halted) {
-            writeStatus(statusFile, 'completed', scanId, frameIndex, totalFrames, 'Scan completed; waiting for target segmentation');
-            print('Completed Top camera scan: ' + scanDir.getAbsolutePath());
+            if (!stopAfterFirstTarget) {
+                writeStatus(statusFile, 'scan_complete', scanId, frameIndex, totalFrames, 'Scan completed; waiting for target segmentation');
+                print('Completed Top camera scan: ' + scanDir.getAbsolutePath());
+            }
             if (waitForSegmentation(scanDir, 120000)) {
-                print('Segmentation complete. Starting left nozzle N1 pick/drop sequence.');
-                pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames);
+                if (interactivePickFile.exists()) {
+                    print('Segmentation complete. Reviewing any remaining interactive targets.');
+                    while (waitForTargetCount(scanDir, interactiveState.reviewedCount + 1, 250)) {
+                        if (!interactiveReviewNextAvailableTarget(
+                                scanDir,
+                                pauseFile,
+                                stopFile,
+                                statusFile,
+                                scanId,
+                                totalFrames,
+                                interactiveState
+                        )) {
+                            return;
+                        }
+                    }
+                    writeStatus(statusFile, 'completed', scanId, interactiveState.reviewedCount, interactiveState.reviewedCount, 'Interactive target review completed');
+                }
+                else if (touchDryRunFile.exists()) {
+                    print('Segmentation complete. Starting left nozzle N1 touch calibration sequence.');
+                    touchTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames);
+                }
+                else {
+                    print('Segmentation complete. Starting left nozzle N1 pick/drop sequence.');
+                    pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames);
+                }
             }
         }
     });
