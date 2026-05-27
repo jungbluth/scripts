@@ -312,6 +312,11 @@ with (imports) {
             return correction;
         }
 
+        var sampleXs = [];
+        var sampleYs = [];
+        var lastZ = correction.z;
+        var lastRecordedAt = null;
+        var fallbackCorrection = null;
         var reader = new BufferedReader(new FileReader(calibrationFile));
         try {
             var line = reader.readLine();
@@ -320,23 +325,38 @@ with (imports) {
                 if (line.length > 0) {
                     try {
                         var record = JSON.parse(line);
-                        if (record.total_correction_x_mm !== undefined
-                                && record.total_correction_y_mm !== undefined) {
-                            correction.x = Number(record.total_correction_x_mm);
-                            correction.y = Number(record.total_correction_y_mm);
+                        if (record.raw_commanded_x_mm !== undefined
+                                && record.raw_commanded_y_mm !== undefined
+                                && record.recorded_x_mm !== undefined
+                                && record.recorded_y_mm !== undefined) {
+                            sampleXs.push(Number(record.recorded_x_mm) - Number(record.raw_commanded_x_mm));
+                            sampleYs.push(Number(record.recorded_y_mm) - Number(record.raw_commanded_y_mm));
                             if (record.recorded_z_mm !== undefined) {
-                                correction.z = Number(record.recorded_z_mm);
+                                lastZ = Number(record.recorded_z_mm);
                             }
-                            correction.source = 'total from ' + record.recorded_at;
+                            lastRecordedAt = record.recorded_at;
+                        }
+                        else if (record.total_correction_x_mm !== undefined
+                                && record.total_correction_y_mm !== undefined) {
+                            fallbackCorrection = {
+                                x: Number(record.total_correction_x_mm),
+                                y: Number(record.total_correction_y_mm),
+                                source: 'latest total from ' + record.recorded_at
+                            };
+                            if (record.recorded_z_mm !== undefined) {
+                                lastZ = Number(record.recorded_z_mm);
+                            }
                         }
                         else if (record.correction_x_mm !== undefined
                                 && record.correction_y_mm !== undefined) {
-                            correction.x = Number(record.correction_x_mm);
-                            correction.y = Number(record.correction_y_mm);
+                            fallbackCorrection = {
+                                x: Number(record.correction_x_mm),
+                                y: Number(record.correction_y_mm),
+                                source: 'legacy residual from ' + record.recorded_at
+                            };
                             if (record.recorded_z_mm !== undefined) {
-                                correction.z = Number(record.recorded_z_mm);
+                                lastZ = Number(record.recorded_z_mm);
                             }
-                            correction.source = 'legacy residual from ' + record.recorded_at;
                         }
                     }
                     catch (parseError) {
@@ -349,7 +369,35 @@ with (imports) {
         finally {
             reader.close();
         }
+
+        if (sampleXs.length > 0 && sampleYs.length > 0) {
+            correction.x = medianNumber(sampleXs);
+            correction.y = medianNumber(sampleYs);
+            correction.z = lastZ;
+            correction.source = 'median of ' + sampleXs.length + ' saved jog sample(s)'
+                + (lastRecordedAt === null ? '' : '; latest ' + lastRecordedAt);
+            return correction;
+        }
+
+        if (fallbackCorrection !== null) {
+            correction.x = fallbackCorrection.x;
+            correction.y = fallbackCorrection.y;
+            correction.z = lastZ;
+            correction.source = fallbackCorrection.source;
+        }
         return correction;
+    }
+
+    function medianNumber(values) {
+        var copy = values.slice(0);
+        copy.sort(function(a, b) {
+            return a - b;
+        });
+        var middle = Math.floor(copy.length / 2);
+        if (copy.length % 2 === 1) {
+            return copy[middle];
+        }
+        return (copy[middle - 1] + copy[middle]) / 2.0;
     }
 
     function showTouchCalibrationWindow(scanDir, statusFile, scanId, totalTargets, target, nozzle, appliedCorrection, moveX, moveY) {
@@ -483,6 +531,23 @@ with (imports) {
         writeStatus(statusFile, 'completed', scanId, targets.length, targets.length, 'Interactive target review completed');
     }
 
+    function interactiveReviewTargetsAsync(scanDir, statusFile, scanId, totalFrames) {
+        var state = makeInteractiveReviewState(scanDir);
+        var targets = readPickTargets(scanDir);
+
+        print('Async interactive pick review has ' + targets.length + ' unique target(s).');
+        print('Async interactive correction starts at dX=' + state.touchCorrection.x.toFixed(3)
+            + ' dY=' + state.touchCorrection.y.toFixed(3)
+            + ' Z=' + state.touchCorrection.z.toFixed(3)
+            + ' source=' + state.touchCorrection.source);
+        if (targets.length === 0) {
+            writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no interactive targets found');
+            return;
+        }
+
+        moveInteractiveReviewTargetAsync(scanDir, statusFile, scanId, targets, state);
+    }
+
     function makeInteractiveReviewState(scanDir) {
         return {
             headName: 'H1',
@@ -572,17 +637,18 @@ with (imports) {
             if (feedback.action === 'save') {
                 var residualX = recorded.x - moveX;
                 var residualY = recorded.y - moveY;
-                state.touchCorrection = {
-                    x: state.touchCorrection.x + residualX,
-                    y: state.touchCorrection.y + residualY,
+                var sampledCorrection = {
+                    x: recorded.x - target.x,
+                    y: recorded.y - target.y,
                     z: recorded.z,
                     source: 'interactive save target ' + target.objectIndex
                 };
-                appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, state.nozzleName, 'save', state.touchCorrection, moveX, moveY, recorded, {
+                appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, state.nozzleName, 'save', sampledCorrection, moveX, moveY, recorded, {
                     residualX: residualX,
                     residualY: residualY
                 });
-                appendTouchCorrectionRecord(scanDir, scanId, target, state.touchCorrection, moveX, moveY, recorded, residualX, residualY);
+                appendTouchCorrectionRecord(scanDir, scanId, target, sampledCorrection, moveX, moveY, recorded, residualX, residualY);
+                state.touchCorrection = readTouchCorrection();
                 state.reviewedCount++;
                 parkNozzlesForScan(pickTool.head);
                 return true;
@@ -593,6 +659,59 @@ with (imports) {
             parkNozzlesForScan(pickTool.head);
             return true;
         }
+    }
+
+    function moveInteractiveReviewTargetAsync(scanDir, statusFile, scanId, targets, state) {
+        if (state.reviewedCount >= targets.length) {
+            writeStatus(statusFile, 'completed', scanId, targets.length, targets.length, 'Interactive target review completed');
+            return;
+        }
+
+        var UiUtils = Packages.org.openpnp.util.UiUtils;
+        UiUtils['submitUiMachineTask(Thrunnable)'](function() {
+            var targetIndex = state.reviewedCount;
+            var target = targets[targetIndex];
+            parkNozzlesForScan(machine.defaultHead);
+            var pickTool = findPickTool(state.headName, state.nozzleName);
+            var nozzle = pickTool.nozzle;
+            var travelZ = nozzle.location.z;
+            var moveX = target.x + state.touchCorrection.x;
+            var moveY = target.y + state.touchCorrection.y;
+            var reviewZ = state.touchCorrection.z;
+
+            writeStatus(
+                statusFile,
+                'awaiting_feedback',
+                scanId,
+                targetIndex + 1,
+                targets.length,
+                'Review target ' + (targetIndex + 1) + ' with nozzle ' + state.nozzleName
+            );
+            print('Async interactive review target ' + (targetIndex + 1) + '/' + targets.length
+                + ' object=' + target.objectIndex
+                + ' nozzle=' + state.nozzleName
+                + ' corrected X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
+                + ' review Z=' + reviewZ.toFixed(3)
+                + ' travel Z=' + travelZ.toFixed(3));
+
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, reviewZ);
+            showInteractiveReviewWindowAsync(
+                scanDir,
+                statusFile,
+                scanId,
+                targetIndex,
+                targets.length,
+                target,
+                nozzle,
+                state,
+                targets,
+                moveX,
+                moveY,
+                reviewZ
+            );
+        });
     }
 
     function showInteractiveReviewWindow(scanDir, scanId, targetIndex, totalTargets, target, nozzle, nozzleName, correction, moveX, moveY, reviewZ) {
@@ -666,7 +785,7 @@ with (imports) {
         return JSON.parse(String(queue.take()));
     }
 
-    function showInteractiveReviewWindowAsync(scanDir, statusFile, scanId, targetIndex, totalTargets, target, initialNozzle, state, moveX, moveY, reviewZ) {
+    function showInteractiveReviewWindowAsync(scanDir, statusFile, scanId, targetIndex, totalTargets, target, initialNozzle, state, targets, moveX, moveY, reviewZ) {
         var runnable = new Packages.java.lang.Runnable({
             run: function() {
                 var JFrame = Packages.javax.swing.JFrame;
@@ -735,6 +854,7 @@ with (imports) {
                 function finish(action, saveCorrection) {
                     var recorded = currentNozzle.location;
                     var residual = null;
+                    var recordedCorrection = state.touchCorrection;
                     if (saveCorrection) {
                         var residualX = recorded.x - currentMoveX;
                         var residualY = recorded.y - currentMoveY;
@@ -742,17 +862,21 @@ with (imports) {
                             residualX: residualX,
                             residualY: residualY
                         };
-                        state.touchCorrection = {
-                            x: state.touchCorrection.x + residualX,
-                            y: state.touchCorrection.y + residualY,
+                        var sampledCorrection = {
+                            x: recorded.x - target.x,
+                            y: recorded.y - target.y,
                             z: recorded.z,
                             source: 'interactive save target ' + target.objectIndex
                         };
-                        appendTouchCorrectionRecord(scanDir, scanId, target, state.touchCorrection, currentMoveX, currentMoveY, recorded, residualX, residualY);
+                        appendTouchCorrectionRecord(scanDir, scanId, target, sampledCorrection, currentMoveX, currentMoveY, recorded, residualX, residualY);
+                        state.touchCorrection = readTouchCorrection();
+                        recordedCorrection = sampledCorrection;
                     }
-                    appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, currentNozzleName, action, state.touchCorrection, currentMoveX, currentMoveY, recorded, residual);
-                    writeStatus(statusFile, 'completed', scanId, targetIndex + 1, totalTargets, 'Interactive target review recorded: ' + action);
+                    appendInteractiveReviewRecord(state.reviewFile, state.scanReviewFile, scanId, scanDir, target, currentNozzleName, action, recordedCorrection, currentMoveX, currentMoveY, recorded, residual);
+                    state.reviewedCount = targetIndex + 1;
+                    writeStatus(statusFile, 'awaiting_feedback', scanId, state.reviewedCount, totalTargets, 'Interactive target review recorded: ' + action);
                     frame.dispose();
+                    moveInteractiveReviewTargetAsync(scanDir, statusFile, scanId, targets, state);
                 }
 
                 correctButton.addActionListener(new ActionListener({
@@ -1357,7 +1481,7 @@ with (imports) {
         var totalFrames = xs.length * ys.length;
         var stopAtFirstTarget = touchDryRunFile.exists() && !interactivePickFile.exists();
         var stopAfterFirstTarget = false;
-        var interactiveState = interactivePickFile.exists() ? makeInteractiveReviewState(scanDir) : null;
+        var interactiveState = null;
 
         print('Starting Top camera scan: ' + scanId);
         print('Frames directory: ' + framesDir.getAbsolutePath());
@@ -1474,25 +1598,6 @@ with (imports) {
                         break;
                     }
 
-                    if (interactiveState !== null) {
-                        while (waitForTargetCount(scanDir, interactiveState.reviewedCount + 1, 250)) {
-                            print('New interactive target available after frame ' + (frameIndex - 1)
-                                + '. Pausing scan for review.');
-                            if (!interactiveReviewNextAvailableTarget(
-                                    scanDir,
-                                    pauseFile,
-                                    stopFile,
-                                    statusFile,
-                                    scanId,
-                                    totalFrames,
-                                    interactiveState
-                            )) {
-                                halted = true;
-                                return;
-                            }
-                            writeStatus(statusFile, 'running', scanId, frameIndex, totalFrames, 'Resuming scan after interactive target review');
-                        }
-                    }
                 }
 
                 if (stopAfterFirstTarget) {
@@ -1511,21 +1616,8 @@ with (imports) {
             }
             if (waitForSegmentation(scanDir, 120000)) {
                 if (interactivePickFile.exists()) {
-                    print('Segmentation complete. Reviewing any remaining interactive targets.');
-                    while (waitForTargetCount(scanDir, interactiveState.reviewedCount + 1, 250)) {
-                        if (!interactiveReviewNextAvailableTarget(
-                                scanDir,
-                                pauseFile,
-                                stopFile,
-                                statusFile,
-                                scanId,
-                                totalFrames,
-                                interactiveState
-                        )) {
-                            return;
-                        }
-                    }
-                    writeStatus(statusFile, 'completed', scanId, interactiveState.reviewedCount, interactiveState.reviewedCount, 'Interactive target review completed');
+                    print('Segmentation complete. Starting jog-friendly interactive target review.');
+                    interactiveReviewTargetsAsync(scanDir, statusFile, scanId, totalFrames);
                 }
                 else if (touchDryRunFile.exists()) {
                     print('Segmentation complete. Starting left nozzle N1 touch calibration sequence.');
