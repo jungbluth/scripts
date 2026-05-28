@@ -59,8 +59,11 @@ COLOR_MIN_AREA_PX = 5000
 COLOR_MAX_AXIS_ASPECT_RATIO = 3.5
 COLOR_MAX_INSIDE_MEAN_INTENSITY = 90
 COLOR_MIN_RECTANGULARITY = 0.20
-COLOR_MAX_SHORT_SIDE_FRACTION = 0.35
-COLOR_MAX_LONG_SIDE_FRACTION = 0.45
+COLOR_MAX_SHORT_SIDE_FRACTION = 0.42
+COLOR_MAX_LONG_SIDE_FRACTION = 0.48
+GLOBAL_DEDUPE_DISTANCE_MM = 6.0
+CONTEXT_PADDING_PX = 900
+COORDINATE_TRANSFORM_VERSION = "image_y_inverted_v2"
 GRAYSCALE_MIN_AREA_PX = 1000
 GRAYSCALE_MIN_AXIS_ASPECT_RATIO = 1.9
 GRAYSCALE_MAX_INSIDE_MEAN_INTENSITY = 55
@@ -576,7 +579,7 @@ def image_point_to_machine_coordinates(
 
     dx_mm = (centroid_x_px - (image_width / 2.0)) * upp_x
     dy_mm = (centroid_y_px - (image_height / 2.0)) * upp_y
-    return frame_center_x + dx_mm, frame_center_y + dy_mm
+    return frame_center_x + dx_mm, frame_center_y - dy_mm
 
 
 def object_machine_coordinates(frame: dict[str, Any], centroid_x_px: float, centroid_y_px: float) -> tuple[float, float]:
@@ -600,6 +603,44 @@ def crop_detection(image: np.ndarray, detection: dict[str, Any], padding: int) -
     x1 = min(image.shape[1], x + w + padding)
     y1 = min(image.shape[0], y + h + padding)
     return image[y0:y1, x0:x1]
+
+
+def detection_quality(record: dict[str, Any]) -> float:
+    edge_penalty = 0.0
+    image_width = float(record.get("image_width_px") or 0)
+    image_height = float(record.get("image_height_px") or 0)
+    bbox_x = float(record.get("bbox_x_px") or 0)
+    bbox_y = float(record.get("bbox_y_px") or 0)
+    bbox_width = float(record.get("bbox_width_px") or 0)
+    bbox_height = float(record.get("bbox_height_px") or 0)
+    if image_width > 0 and image_height > 0 and bbox_width > 0 and bbox_height > 0:
+        edge_clearance = min(
+            bbox_x,
+            bbox_y,
+            image_width - (bbox_x + bbox_width),
+            image_height - (bbox_y + bbox_height),
+        )
+        edge_penalty = max(0.0, 120.0 - edge_clearance) * 20000.0
+    return float(record.get("score") or 0.0) + (float(record.get("bbox_area_px") or 0.0) * 80.0) - edge_penalty
+
+
+def deduplicate_records(records: list[dict[str, Any]], minimum_distance_mm: float) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    for record in sorted(records, key=detection_quality, reverse=True):
+        duplicate = False
+        for kept in unique:
+            dx = float(record["pick_x_mm"]) - float(kept["pick_x_mm"])
+            dy = float(record["pick_y_mm"]) - float(kept["pick_y_mm"])
+            if (dx * dx + dy * dy) ** 0.5 < minimum_distance_mm:
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append(record)
+
+    unique.sort(key=lambda item: (int(item["frame_index"]), int(item["object_index"])))
+    for object_index, record in enumerate(unique):
+        record["object_index"] = object_index
+    return unique
 
 
 def mark_centroid(image: np.ndarray, center_x: float, center_y: float) -> None:
@@ -691,6 +732,7 @@ def object_record(
     frame: dict[str, Any],
     detection: dict[str, Any],
     crop_file: str,
+    context_file: str,
     overlay_file: str,
 ) -> dict[str, Any]:
     machine_x, machine_y = object_machine_coordinates(
@@ -710,8 +752,10 @@ def object_record(
         "object_index": object_index,
         "frame_index": frame["frame_index"],
         "camera": frame.get("camera", "Top"),
+        "coordinate_transform_version": COORDINATE_TRANSFORM_VERSION,
         "source_file": frame["file_name"],
         "crop_file": crop_file,
+        "context_file": context_file,
         "overlay_file": overlay_file,
         "frame_x_mm": frame["x_mm"],
         "frame_y_mm": frame["y_mm"],
@@ -759,8 +803,10 @@ def csv_fields() -> list[str]:
         "object_index",
         "frame_index",
         "camera",
+        "coordinate_transform_version",
         "source_file",
         "crop_file",
+        "context_file",
         "overlay_file",
         "frame_x_mm",
         "frame_y_mm",
@@ -811,6 +857,7 @@ def process_frame(
     overlays_dir: Path,
     objects_file: Any,
     csv_writer: csv.DictWriter,
+    all_records: list[dict[str, Any]],
     args: argparse.Namespace,
 ) -> int:
     image_path = scan_dir / frame["file_name"]
@@ -841,17 +888,23 @@ def process_frame(
 
     for frame_detection_index, detection in enumerate(detections, start=1):
         crop = crop_detection(image, detection, args.crop_padding)
+        context = crop_detection(image, detection, CONTEXT_PADDING_PX)
         object_name = f"object_{object_index:06d}_frame_{frame['frame_index']:05d}.png"
+        context_name = f"context_{object_index:06d}_frame_{frame['frame_index']:05d}.png"
         crop_path = objects_dir / object_name
+        context_path = objects_dir / context_name
         cv2.imwrite(str(crop_path), crop)
+        cv2.imwrite(str(context_path), context)
 
         record = object_record(
             object_index=object_index,
             frame=frame,
             detection=detection,
             crop_file=f"objects/{object_name}",
+            context_file=f"objects/{context_name}",
             overlay_file=overlay_file,
         )
+        all_records.append(record)
         objects_file.write(json.dumps(record, sort_keys=True) + "\n")
         objects_file.flush()
         csv_writer.writerow(record)
@@ -864,6 +917,23 @@ def process_frame(
         write_detection_preview(scan_dir, frame, overlay, overlay_path, detections)
 
     return object_index
+
+
+def rewrite_unique_records(scan_dir: Path, records: list[dict[str, Any]]) -> int:
+    unique_records = deduplicate_records(records, GLOBAL_DEDUPE_DISTANCE_MM)
+    objects_path = scan_dir / "objects.jsonl"
+    csv_path = scan_dir / "objects.csv"
+
+    with objects_path.open("w", encoding="utf-8") as objects_file, csv_path.open(
+        "w", encoding="utf-8", newline=""
+    ) as csv_file:
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields())
+        csv_writer.writeheader()
+        for record in unique_records:
+            objects_file.write(json.dumps(record, sort_keys=True) + "\n")
+            csv_writer.writerow(record)
+
+    return len(unique_records)
 
 
 def scan_is_done(scan_dir: Path, processed_frames: int) -> bool:
@@ -899,6 +969,7 @@ def run(args: argparse.Namespace) -> None:
     objects_path = scan_dir / "objects.jsonl"
     csv_path = scan_dir / "objects.csv"
     object_index = 0
+    all_records: list[dict[str, Any]] = []
     processed_keys: set[tuple[int, str]] = set()
     write_detection_status(
         scan_dir,
@@ -932,6 +1003,7 @@ def run(args: argparse.Namespace) -> None:
                     overlays_dir,
                     objects_file,
                     csv_writer,
+                    all_records,
                     args,
                 )
                 processed_keys.add(key)
@@ -955,9 +1027,13 @@ def run(args: argparse.Namespace) -> None:
             preview_file=None,
             message="No bug silhouettes detected in this segmentation run",
         )
-    write_segmentation_complete(scan_dir, object_index, len(processed_keys))
+    unique_object_count = rewrite_unique_records(scan_dir, all_records) if all_records else 0
+    write_segmentation_complete(scan_dir, unique_object_count, len(processed_keys))
 
-    print(f"Segmented {object_index} candidate bug silhouette(s)")
+    print(
+        f"Segmented {unique_object_count} unique bug silhouette(s)"
+        f" from {object_index} frame candidate(s)"
+    )
     print(f"Wrote {csv_path}")
     print(f"Wrote {objects_path}")
 

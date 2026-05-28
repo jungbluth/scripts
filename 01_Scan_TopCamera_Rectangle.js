@@ -32,6 +32,7 @@ with (imports) {
         : previousPython.exists()
         ? previousPython.getAbsolutePath()
         : 'python3';
+    var currentCoordinateTransformVersion = 'image_y_inverted_v2';
 
     function pad(number, width) {
         var text = String(number);
@@ -314,6 +315,7 @@ with (imports) {
 
         var sampleXs = [];
         var sampleYs = [];
+        var legacySampleXs = [];
         var lastZ = correction.z;
         var lastRecordedAt = null;
         var fallbackCorrection = null;
@@ -329,8 +331,15 @@ with (imports) {
                                 && record.raw_commanded_y_mm !== undefined
                                 && record.recorded_x_mm !== undefined
                                 && record.recorded_y_mm !== undefined) {
-                            sampleXs.push(Number(record.recorded_x_mm) - Number(record.raw_commanded_x_mm));
-                            sampleYs.push(Number(record.recorded_y_mm) - Number(record.raw_commanded_y_mm));
+                            var sampleX = Number(record.recorded_x_mm) - Number(record.raw_commanded_x_mm);
+                            var sampleY = Number(record.recorded_y_mm) - Number(record.raw_commanded_y_mm);
+                            if (String(record.coordinate_transform_version || '') === currentCoordinateTransformVersion) {
+                                sampleXs.push(sampleX);
+                                sampleYs.push(sampleY);
+                            }
+                            else {
+                                legacySampleXs.push(sampleX);
+                            }
                             if (record.recorded_z_mm !== undefined) {
                                 lastZ = Number(record.recorded_z_mm);
                             }
@@ -375,6 +384,16 @@ with (imports) {
             correction.y = medianNumber(sampleYs);
             correction.z = lastZ;
             correction.source = 'median of ' + sampleXs.length + ' saved jog sample(s)'
+                + (lastRecordedAt === null ? '' : '; latest ' + lastRecordedAt);
+            return correction;
+        }
+
+        if (legacySampleXs.length > 0) {
+            correction.x = medianNumber(legacySampleXs);
+            correction.y = 0.0;
+            correction.z = lastZ;
+            correction.source = 'legacy X median of ' + legacySampleXs.length + ' sample(s); Y reset for '
+                + currentCoordinateTransformVersion
                 + (lastRecordedAt === null ? '' : '; latest ' + lastRecordedAt);
             return correction;
         }
@@ -931,7 +950,9 @@ with (imports) {
     }
 
     function makeTargetImageLabel(scanDir, target, ImageIcon, JLabel, Image) {
-        var relativePath = target.overlayFile && target.overlayFile.length > 0
+        var relativePath = target.contextFile && target.contextFile.length > 0
+            ? target.contextFile
+            : target.overlayFile && target.overlayFile.length > 0
             ? target.overlayFile
             : target.sourceFile && target.sourceFile.length > 0
             ? target.sourceFile
@@ -976,7 +997,9 @@ with (imports) {
             raw_y_mm: target.y,
             source_file: target.sourceFile,
             crop_file: target.cropFile,
+            context_file: target.contextFile,
             overlay_file: target.overlayFile,
+            coordinate_transform_version: target.coordinateTransformVersion,
             bbox_x_px: target.bboxX,
             bbox_y_px: target.bboxY,
             bbox_width_px: target.bboxWidth,
@@ -1014,7 +1037,9 @@ with (imports) {
             raw_commanded_y_mm: target.y,
             source_file: target.sourceFile,
             crop_file: target.cropFile,
+            context_file: target.contextFile,
             overlay_file: target.overlayFile,
+            coordinate_transform_version: target.coordinateTransformVersion,
             bbox_x_px: target.bboxX,
             bbox_y_px: target.bboxY,
             bbox_width_px: target.bboxWidth,
@@ -1308,6 +1333,7 @@ with (imports) {
                         if (pickX !== undefined && pickY !== undefined) {
                             targets.push({
                                 objectIndex: record.object_index,
+                                coordinateTransformVersion: String(record.coordinate_transform_version || ''),
                                 x: Number(pickX),
                                 y: Number(pickY),
                                 estimatedX: Number(record.estimated_x_mm),
@@ -1319,6 +1345,7 @@ with (imports) {
                                 requestedEstimateX: Number(record.requested_frame_estimated_x_mm),
                                 requestedEstimateY: Number(record.requested_frame_estimated_y_mm),
                                 cropFile: String(record.crop_file || ''),
+                                contextFile: String(record.context_file || ''),
                                 overlayFile: String(record.overlay_file || ''),
                                 sourceFile: String(record.source_file || ''),
                                 bboxX: Number(record.bbox_x_px || 0),
