@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""02: Segment dark rectangular targets from a Top-camera scan.
+"""02: Segment dark bug silhouettes from a Top-camera scan.
 
 Usage:
     python3 scripts/02_Segment_Scan_Objects.py scans/scan_YYYYMMDD_HHMMSS
@@ -35,19 +35,36 @@ except ModuleNotFoundError as exc:
     raise SystemExit(2) from exc
 
 
-MIN_AREA_PX = 12000
-MAX_AREA_FRACTION = 0.05
-MAX_RECT_AREA_FRACTION = 0.06
-MAX_SHORT_SIDE_FRACTION = 0.22
-MAX_LONG_SIDE_FRACTION = 0.40
-MIN_RECTANGULARITY = 0.75
-MIN_ASPECT_RATIO = 1.45
-MAX_ASPECT_RATIO = 2.85
-MAX_INSIDE_MEAN_INTENSITY = 70
-MIN_BACKGROUND_CONTRAST = 35
-FIXED_DARK_THRESHOLD = 75
-CLOSE_KERNEL_SIZE = 15
-OPEN_KERNEL_SIZE = 5
+MIN_AREA_PX = 80
+MAX_AREA_FRACTION = 0.03
+MAX_RECT_AREA_FRACTION = 0.02
+MAX_SHORT_SIDE_FRACTION = 0.12
+MAX_LONG_SIDE_FRACTION = 0.18
+MIN_RECTANGULARITY = 0.02
+MIN_ASPECT_RATIO = 0.20
+MAX_ASPECT_RATIO = 5.00
+MAX_INSIDE_MEAN_INTENSITY = 165
+MIN_BACKGROUND_CONTRAST = 25
+FIXED_DARK_THRESHOLD = 70
+CLOSE_KERNEL_SIZE = 13
+OPEN_KERNEL_SIZE = 2
+PINK_MIN_SATURATION = 60
+PINK_MIN_VALUE = 65
+PINK_DILATE_KERNEL_SIZE = 15
+PINK_RED_DOMINANCE = 18
+BUG_MIN_FILL_RATIO = 0.04
+IMAGE_EDGE_REJECT_MARGIN_PX = 40
+COLOR_PRESENT_SATURATION_P99 = 20
+COLOR_MIN_AREA_PX = 5000
+COLOR_MAX_AXIS_ASPECT_RATIO = 3.5
+COLOR_MAX_INSIDE_MEAN_INTENSITY = 90
+COLOR_MIN_RECTANGULARITY = 0.20
+COLOR_MAX_SHORT_SIDE_FRACTION = 0.35
+COLOR_MAX_LONG_SIDE_FRACTION = 0.45
+GRAYSCALE_MIN_AREA_PX = 1000
+GRAYSCALE_MIN_AXIS_ASPECT_RATIO = 1.9
+GRAYSCALE_MAX_INSIDE_MEAN_INTENSITY = 55
+GRAYSCALE_MIN_RECTANGULARITY = 0.55
 EDGE_MIN_AREA_PX = 3000
 EDGE_MIN_RECTANGULARITY = 0.35
 EDGE_MIN_ASPECT_RATIO = 1.20
@@ -126,6 +143,52 @@ def make_dark_mask(gray: np.ndarray, threshold: int) -> np.ndarray:
         cv2.getStructuringElement(cv2.MORPH_RECT, (OPEN_KERNEL_SIZE, OPEN_KERNEL_SIZE)),
     )
     return mask
+
+
+def make_pink_mask(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    blue = image[:, :, 0].astype(np.int16)
+    green = image[:, :, 1].astype(np.int16)
+    red = image[:, :, 2].astype(np.int16)
+
+    red_dominant_pink = (
+        (saturation >= PINK_MIN_SATURATION)
+        & (value >= PINK_MIN_VALUE)
+        & (red - np.maximum(green, blue) >= PINK_RED_DOMINANCE)
+    )
+    pink_pixels = red_dominant_pink
+    mask = (pink_pixels.astype(np.uint8)) * 255
+    mask = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (PINK_DILATE_KERNEL_SIZE, PINK_DILATE_KERNEL_SIZE),
+        ),
+        iterations=1,
+    )
+    return mask
+
+
+def make_bug_mask(image: np.ndarray, threshold: int) -> tuple[np.ndarray, np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, dark_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
+    pink_mask = make_pink_mask(image)
+    mask = cv2.bitwise_and(dark_mask, cv2.bitwise_not(pink_mask))
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (OPEN_KERNEL_SIZE, OPEN_KERNEL_SIZE)),
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (CLOSE_KERNEL_SIZE, CLOSE_KERNEL_SIZE)),
+    )
+    return gray, mask
 
 
 def make_edge_mask(gray: np.ndarray) -> np.ndarray:
@@ -354,6 +417,149 @@ def detect_rectangles(
         require_dark=False,
     )
     return deduplicate_detections(dark_detections + edge_detections)
+
+
+def detect_bugs(
+    image: np.ndarray,
+    gray: np.ndarray,
+    mask: np.ndarray,
+    *,
+    min_area_px: int,
+    max_area_fraction: float,
+    max_short_side_fraction: float,
+    max_long_side_fraction: float,
+    min_rectangularity: float,
+    min_aspect_ratio: float,
+    max_aspect_ratio: float,
+    max_inside_mean_intensity: float,
+    min_background_contrast: float,
+) -> list[dict[str, Any]]:
+    image_area = gray.shape[0] * gray.shape[1]
+    reference_side = min(gray.shape[0], gray.shape[1])
+    saturation_p99 = float(np.percentile(cv2.cvtColor(image, cv2.COLOR_BGR2HSV)[:, :, 1], 99))
+    color_present = saturation_p99 >= COLOR_PRESENT_SATURATION_P99
+    effective_min_area_px = max(min_area_px, COLOR_MIN_AREA_PX) if color_present else max(
+        min_area_px,
+        GRAYSCALE_MIN_AREA_PX,
+    )
+    effective_min_aspect_ratio = min_aspect_ratio if color_present else max(
+        min_aspect_ratio,
+        GRAYSCALE_MIN_AXIS_ASPECT_RATIO,
+    )
+    effective_max_aspect_ratio = (
+        min(max_aspect_ratio, COLOR_MAX_AXIS_ASPECT_RATIO)
+        if color_present
+        else max_aspect_ratio
+    )
+    effective_min_rectangularity = max(
+        min_rectangularity,
+        COLOR_MIN_RECTANGULARITY if color_present else GRAYSCALE_MIN_RECTANGULARITY,
+    )
+    effective_max_inside_mean = (
+        min(max_inside_mean_intensity, COLOR_MAX_INSIDE_MEAN_INTENSITY)
+        if color_present
+        else min(max_inside_mean_intensity, GRAYSCALE_MAX_INSIDE_MEAN_INTENSITY)
+    )
+    effective_max_short_side_fraction = (
+        max(max_short_side_fraction, COLOR_MAX_SHORT_SIDE_FRACTION)
+        if color_present
+        else max_short_side_fraction
+    )
+    effective_max_long_side_fraction = (
+        max(max_long_side_fraction, COLOR_MAX_LONG_SIDE_FRACTION)
+        if color_present
+        else max_long_side_fraction
+    )
+    max_area = image_area * max_area_fraction
+    max_short_side = reference_side * effective_max_short_side_fraction
+    max_long_side = reference_side * effective_max_long_side_fraction
+
+    detections: list[dict[str, Any]] = []
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < effective_min_area_px or area > max_area:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if (
+            x <= IMAGE_EDGE_REJECT_MARGIN_PX
+            or y <= IMAGE_EDGE_REJECT_MARGIN_PX
+            or x + w >= gray.shape[1] - IMAGE_EDGE_REJECT_MARGIN_PX
+            or y + h >= gray.shape[0] - IMAGE_EDGE_REJECT_MARGIN_PX
+        ):
+            continue
+
+        short_side = float(min(w, h))
+        long_side = float(max(w, h))
+        if short_side <= 0:
+            continue
+        axis_aspect_ratio = long_side / short_side
+        if axis_aspect_ratio < effective_min_aspect_ratio or axis_aspect_ratio > effective_max_aspect_ratio:
+            continue
+        if short_side > max_short_side or long_side > max_long_side:
+            continue
+
+        bbox_area = float(w * h)
+        fill_ratio = area / bbox_area if bbox_area else 0.0
+        if fill_ratio < BUG_MIN_FILL_RATIO:
+            continue
+
+        moments = cv2.moments(contour)
+        if abs(moments["m00"]) < 0.000001:
+            continue
+        center_x = moments["m10"] / moments["m00"]
+        center_y = moments["m01"] / moments["m00"]
+
+        mean_intensity, background_mean, contrast = contour_contrast(gray, contour)
+        if mean_intensity > effective_max_inside_mean:
+            continue
+        if contrast < min_background_contrast:
+            continue
+
+        rect = cv2.minAreaRect(contour)
+        (_, _), (rect_width, rect_height), angle = rect
+        rect_area = float(rect_width * rect_height)
+        if rect_area <= 0:
+            continue
+        rect_short_side = float(min(rect_width, rect_height))
+        rect_long_side = float(max(rect_width, rect_height))
+        aspect_ratio = rect_long_side / rect_short_side if rect_short_side else 0.0
+        rectangularity = area / rect_area
+        if rectangularity < effective_min_rectangularity:
+            continue
+        box = cv2.boxPoints(rect)
+        box = np.intp(box)
+        score = contrast * area * min(fill_ratio * 4.0, 1.0)
+
+        detections.append(
+            {
+                "detection_method": "bug_dark_color_mask",
+                "centroid_x_px": float(center_x),
+                "centroid_y_px": float(center_y),
+                "axis_bbox_x_px": int(x),
+                "axis_bbox_y_px": int(y),
+                "axis_bbox_width_px": int(w),
+                "axis_bbox_height_px": int(h),
+                "rotated_box_px": box.astype(float).tolist(),
+                "area_px": area,
+                "rect_area_px": rect_area,
+                "rect_width_px": float(rect_width),
+                "rect_height_px": float(rect_height),
+                "rect_short_side_px": rect_short_side,
+                "rect_long_side_px": rect_long_side,
+                "rectangularity": float(rectangularity),
+                "aspect_ratio": float(aspect_ratio),
+                "mean_intensity": mean_intensity,
+                "background_mean_intensity": background_mean,
+                "background_contrast": contrast,
+                "absolute_background_contrast": abs(contrast),
+                "angle_degrees": float(angle),
+                "score": float(score),
+            }
+        )
+
+    return deduplicate_detections(detections)
 
 
 def image_point_to_machine_coordinates(
@@ -613,18 +819,14 @@ def process_frame(
         print(f"Skipping unreadable image: {image_path}", file=sys.stderr)
         return object_index
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    dark_mask = make_dark_mask(gray, args.dark_threshold)
-    edge_mask = make_edge_mask(gray)
-    mask = cv2.bitwise_or(dark_mask, edge_mask)
-    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    detections = detect_rectangles(
+    gray, mask = make_bug_mask(image, args.dark_threshold)
+    overlay = image.copy()
+    detections = detect_bugs(
+        image,
         gray,
-        dark_mask,
-        edge_mask,
+        mask,
         min_area_px=args.min_area,
         max_area_fraction=args.max_area_fraction,
-        max_rect_area_fraction=args.max_rect_area_fraction,
         max_short_side_fraction=args.max_short_side_fraction,
         max_long_side_fraction=args.max_long_side_fraction,
         min_rectangularity=args.min_rectangularity,
@@ -638,7 +840,7 @@ def process_frame(
     overlay_path = overlays_dir / overlay_name
 
     for frame_detection_index, detection in enumerate(detections, start=1):
-        crop = crop_detection(mask, detection, args.crop_padding)
+        crop = crop_detection(image, detection, args.crop_padding)
         object_name = f"object_{object_index:06d}_frame_{frame['frame_index']:05d}.png"
         crop_path = objects_dir / object_name
         cv2.imwrite(str(crop_path), crop)
@@ -751,11 +953,11 @@ def run(args: argparse.Namespace) -> None:
             "none_found",
             frame_index=max((key[0] for key in processed_keys), default=None),
             preview_file=None,
-            message="No rectangles detected in this segmentation run",
+            message="No bug silhouettes detected in this segmentation run",
         )
     write_segmentation_complete(scan_dir, object_index, len(processed_keys))
 
-    print(f"Segmented {object_index} candidate objects")
+    print(f"Segmented {object_index} candidate bug silhouette(s)")
     print(f"Wrote {csv_path}")
     print(f"Wrote {objects_path}")
 

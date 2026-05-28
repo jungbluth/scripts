@@ -974,6 +974,18 @@ with (imports) {
             nozzle_name: nozzleName,
             raw_x_mm: target.x,
             raw_y_mm: target.y,
+            source_file: target.sourceFile,
+            crop_file: target.cropFile,
+            overlay_file: target.overlayFile,
+            bbox_x_px: target.bboxX,
+            bbox_y_px: target.bboxY,
+            bbox_width_px: target.bboxWidth,
+            bbox_height_px: target.bboxHeight,
+            bbox_area_px: target.bboxArea,
+            image_width_px: target.imageWidth,
+            image_height_px: target.imageHeight,
+            detection_score: target.score,
+            detection_quality_score: targetQualityScore(target),
             commanded_x_mm: moveX,
             commanded_y_mm: moveY,
             recorded_x_mm: recorded.x,
@@ -1000,6 +1012,18 @@ with (imports) {
             object_index: target.objectIndex,
             raw_commanded_x_mm: target.x,
             raw_commanded_y_mm: target.y,
+            source_file: target.sourceFile,
+            crop_file: target.cropFile,
+            overlay_file: target.overlayFile,
+            bbox_x_px: target.bboxX,
+            bbox_y_px: target.bboxY,
+            bbox_width_px: target.bboxWidth,
+            bbox_height_px: target.bboxHeight,
+            bbox_area_px: target.bboxArea,
+            image_width_px: target.imageWidth,
+            image_height_px: target.imageHeight,
+            detection_score: target.score,
+            detection_quality_score: targetQualityScore(target),
             commanded_x_mm: moveX,
             commanded_y_mm: moveY,
             recorded_x_mm: recorded.x,
@@ -1297,6 +1321,13 @@ with (imports) {
                                 cropFile: String(record.crop_file || ''),
                                 overlayFile: String(record.overlay_file || ''),
                                 sourceFile: String(record.source_file || ''),
+                                bboxX: Number(record.bbox_x_px || 0),
+                                bboxY: Number(record.bbox_y_px || 0),
+                                bboxWidth: Number(record.bbox_width_px || 0),
+                                bboxHeight: Number(record.bbox_height_px || 0),
+                                bboxArea: Number(record.bbox_area_px || 0),
+                                imageWidth: Number(record.image_width_px || 0),
+                                imageHeight: Number(record.image_height_px || 0),
                                 score: Number(record.score || 0)
                             });
                         }
@@ -1313,9 +1344,23 @@ with (imports) {
         }
 
         targets.sort(function(a, b) {
-            return b.score - a.score;
+            return targetQualityScore(b) - targetQualityScore(a);
         });
-        return deduplicateTargets(targets, 5.0);
+        return deduplicateTargets(targets, 6.0);
+    }
+
+    function targetQualityScore(target) {
+        var edgePenalty = 0.0;
+        if (target.imageWidth > 0 && target.imageHeight > 0
+                && target.bboxWidth > 0 && target.bboxHeight > 0) {
+            var left = target.bboxX;
+            var top = target.bboxY;
+            var right = target.imageWidth - (target.bboxX + target.bboxWidth);
+            var bottom = target.imageHeight - (target.bboxY + target.bboxHeight);
+            var edgeClearance = Math.min(Math.min(left, right), Math.min(top, bottom));
+            edgePenalty = Math.max(0.0, 120.0 - edgeClearance) * 20000.0;
+        }
+        return target.score + (target.bboxArea * 80.0) - edgePenalty;
     }
 
     function deduplicateTargets(targets, minimumDistanceMm) {
@@ -1446,12 +1491,13 @@ with (imports) {
         var xLeft = 361.0;
         var xRight = 411.0;
         var yTop = 208.0;
-        var yBottom = 319.0;
+        var fullYBottom = 319.0;
+        var yBottom = yTop + ((fullYBottom - yTop) * 0.25);
         var cameraXOffsetMm = -23.0;
         var cameraYOffsetMm = 64.0;
 
-        var xStepMm = 12.0;
-        var yStepMm = 9.5;
+        var xStepMm = 8.0;
+        var yStepMm = 5.0;
 
         var controlDir = new File(projectDir, 'control');
         var pauseFile = new File(controlDir, 'pause.flag');
@@ -1485,6 +1531,11 @@ with (imports) {
 
         print('Starting Top camera scan: ' + scanId);
         print('Frames directory: ' + framesDir.getAbsolutePath());
+        print('Scan test area: X=' + xLeft.toFixed(3) + '..' + xRight.toFixed(3)
+            + ' Y=' + yTop.toFixed(3) + '..' + yBottom.toFixed(3)
+            + ' (top 25% of full Y range ending at ' + fullYBottom.toFixed(3) + ')');
+        print('Scan overlap step: X step=' + xStepMm.toFixed(3)
+            + ' Y step=' + yStepMm.toFixed(3));
         print('Grid: ' + xs.length + ' columns x ' + ys.length + ' rows');
         print('Stop at first detected target: ' + stopAtFirstTarget);
         print('Camera X compensation: ' + cameraXOffsetMm.toFixed(3) + ' mm');
