@@ -986,6 +986,117 @@ with (imports) {
         return label;
     }
 
+    function makeScaledImageLabel(imageFile, ImageIcon, JLabel, Image, maxWidth, maxHeight) {
+        if (!imageFile.exists()) {
+            return null;
+        }
+
+        var icon = new ImageIcon(imageFile.getAbsolutePath());
+        var image = icon.getImage();
+        var width = icon.getIconWidth();
+        var height = icon.getIconHeight();
+        if (width > maxWidth || height > maxHeight) {
+            var scale = Math.min(maxWidth / width, maxHeight / height);
+            image = image.getScaledInstance(
+                Math.max(1, Math.round(width * scale)),
+                Math.max(1, Math.round(height * scale)),
+                Image.SCALE_SMOOTH
+            );
+            icon = new ImageIcon(image);
+        }
+
+        return new JLabel(icon);
+    }
+
+    function readJsonFile(file) {
+        if (!file.exists()) {
+            return null;
+        }
+        var reader = new BufferedReader(new FileReader(file));
+        var text = '';
+        try {
+            var line = reader.readLine();
+            while (line !== null) {
+                text += String(line);
+                line = reader.readLine();
+            }
+        }
+        finally {
+            reader.close();
+        }
+        return JSON.parse(text);
+    }
+
+    function showDetectionSummaryAndHalt(scanDir, statusFile, scanId, totalFrames) {
+        var complete = readJsonFile(new File(scanDir, 'segmentation_complete.json'));
+        var summaryFile = complete !== null && complete.summary_file
+            ? new File(scanDir, String(complete.summary_file))
+            : new File(scanDir, 'detection_summary.png');
+        var queue = new Packages.java.util.concurrent.ArrayBlockingQueue(1);
+        var runnable = new Packages.java.lang.Runnable({
+            run: function() {
+                var JFrame = Packages.javax.swing.JFrame;
+                var JPanel = Packages.javax.swing.JPanel;
+                var JLabel = Packages.javax.swing.JLabel;
+                var JButton = Packages.javax.swing.JButton;
+                var ImageIcon = Packages.javax.swing.ImageIcon;
+                var BorderLayout = Packages.java.awt.BorderLayout;
+                var GridLayout = Packages.java.awt.GridLayout;
+                var FlowLayout = Packages.java.awt.FlowLayout;
+                var Image = Packages.java.awt.Image;
+                var EmptyBorder = Packages.javax.swing.border.EmptyBorder;
+                var ActionListener = Packages.java.awt.event.ActionListener;
+                var WindowAdapter = Packages.java.awt.event.WindowAdapter;
+
+                var frame = new JFrame('Detected Bug Summary');
+                frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+                frame.setAlwaysOnTop(true);
+
+                var panel = new JPanel(new BorderLayout(8, 8));
+                panel.setBorder(new EmptyBorder(12, 12, 12, 12));
+
+                var details = new JPanel(new GridLayout(0, 1, 2, 2));
+                var objectCount = complete === null ? 0 : Number(complete.object_count || 0);
+                var candidateCount = complete === null ? 0 : Number(complete.candidate_count || 0);
+                var duplicateCount = complete === null ? 0 : Number(complete.duplicate_count || 0);
+                details.add(new JLabel('Unique targets: ' + objectCount));
+                details.add(new JLabel('Frame candidates: ' + candidateCount + '   Duplicates: ' + duplicateCount));
+                panel.add(details, BorderLayout.NORTH);
+
+                var imageLabel = makeScaledImageLabel(summaryFile, ImageIcon, JLabel, Image, 1180, 760);
+                if (imageLabel !== null) {
+                    panel.add(imageLabel, BorderLayout.CENTER);
+                }
+                else {
+                    panel.add(new JLabel('No detection summary image found: ' + summaryFile.getAbsolutePath()), BorderLayout.CENTER);
+                }
+
+                var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+                var closeButton = new JButton('Close');
+                buttons.add(closeButton);
+                panel.add(buttons, BorderLayout.SOUTH);
+
+                function closeAndHalt() {
+                    queue.offer('closed');
+                    frame.dispose();
+                }
+
+                closeButton.addActionListener(new ActionListener({ actionPerformed: function(event) { closeAndHalt(); } }));
+                frame.addWindowListener(new WindowAdapter({ windowClosing: function(event) { closeAndHalt(); } }));
+
+                frame.setContentPane(panel);
+                frame.pack();
+                frame.setLocationRelativeTo(null);
+                frame.setVisible(true);
+            }
+        });
+
+        Packages.javax.swing.SwingUtilities.invokeLater(runnable);
+        queue.take();
+        writeStatus(statusFile, 'halted', scanId, totalFrames, totalFrames, 'Detection summary closed by user');
+        print('Detection summary closed. Halting before pick/drop.');
+    }
+
     function appendInteractiveReviewRecord(reviewFile, scanReviewFile, scanId, scanDir, target, nozzleName, action, correction, moveX, moveY, recorded, residual) {
         var record = {
             scan_id: scanId,
@@ -1694,8 +1805,8 @@ with (imports) {
             }
             if (waitForSegmentation(scanDir, 120000)) {
                 if (interactivePickFile.exists()) {
-                    print('Segmentation complete. Starting jog-friendly interactive target review.');
-                    interactiveReviewTargetsAsync(scanDir, statusFile, scanId, totalFrames);
+                    print('Segmentation complete. Showing numbered detection summary.');
+                    showDetectionSummaryAndHalt(scanDir, statusFile, scanId, totalFrames);
                 }
                 else if (touchDryRunFile.exists()) {
                     print('Segmentation complete. Starting left nozzle N1 touch calibration sequence.');

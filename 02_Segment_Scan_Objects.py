@@ -77,9 +77,11 @@ EDGE_CANNY_LOW = 18
 EDGE_CANNY_HIGH = 55
 
 BOUNDING_BOX_COLOR = (0, 255, 0)
+DUPLICATE_BOX_COLOR = (0, 165, 255)
 CENTROID_COLOR = (0, 0, 255)
 LABEL_COLOR = (255, 255, 255)
 LABEL_BACKGROUND_COLOR = (0, 128, 0)
+DUPLICATE_LABEL_BACKGROUND_COLOR = (0, 100, 220)
 LINE_THICKNESS = 2
 CENTROID_MARK_SIZE = 10
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -101,12 +103,22 @@ def write_detection_status(scan_dir: Path, status: str, **values: Any) -> None:
     DETECTION_STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def write_segmentation_complete(scan_dir: Path, object_count: int, processed_count: int) -> None:
+def write_segmentation_complete(
+    scan_dir: Path,
+    object_count: int,
+    processed_count: int,
+    candidate_count: int,
+    duplicate_count: int,
+    summary_file: str | None,
+) -> None:
     complete_path = scan_dir / "segmentation_complete.json"
     payload = {
         "status": "completed",
         "scan_dir": str(scan_dir),
         "object_count": object_count,
+        "candidate_count": candidate_count,
+        "duplicate_count": duplicate_count,
+        "summary_file": summary_file,
         "processed_frame_count": processed_count,
         "updated_at": datetime.now().isoformat(),
     }
@@ -624,22 +636,42 @@ def detection_quality(record: dict[str, Any]) -> float:
     return float(record.get("score") or 0.0) + (float(record.get("bbox_area_px") or 0.0) * 80.0) - edge_penalty
 
 
-def deduplicate_records(records: list[dict[str, Any]], minimum_distance_mm: float) -> list[dict[str, Any]]:
+def assign_duplicate_metadata(records: list[dict[str, Any]], minimum_distance_mm: float) -> list[dict[str, Any]]:
     unique: list[dict[str, Any]] = []
+    duplicate_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for candidate_index, record in enumerate(records):
+        record["candidate_index"] = candidate_index
+        record["is_duplicate"] = False
+        record["duplicate_of_object_index"] = None
+        record["duplicate_distance_mm"] = None
+
     for record in sorted(records, key=detection_quality, reverse=True):
-        duplicate = False
+        duplicate_of: dict[str, Any] | None = None
+        duplicate_distance: float | None = None
         for kept in unique:
             dx = float(record["pick_x_mm"]) - float(kept["pick_x_mm"])
             dy = float(record["pick_y_mm"]) - float(kept["pick_y_mm"])
-            if (dx * dx + dy * dy) ** 0.5 < minimum_distance_mm:
-                duplicate = True
+            distance = (dx * dx + dy * dy) ** 0.5
+            if distance < minimum_distance_mm:
+                duplicate_of = kept
+                duplicate_distance = distance
                 break
-        if not duplicate:
+        if duplicate_of is None:
             unique.append(record)
+        else:
+            record["is_duplicate"] = True
+            record["duplicate_distance_mm"] = duplicate_distance
+            duplicate_pairs.append((record, duplicate_of))
 
     unique.sort(key=lambda item: (int(item["frame_index"]), int(item["object_index"])))
     for object_index, record in enumerate(unique):
         record["object_index"] = object_index
+        record["is_duplicate"] = False
+        record["duplicate_of_object_index"] = None
+        record["duplicate_distance_mm"] = None
+
+    for duplicate, kept in duplicate_pairs:
+        duplicate["duplicate_of_object_index"] = kept["object_index"]
     return unique
 
 
@@ -662,7 +694,12 @@ def mark_centroid(image: np.ndarray, center_x: float, center_y: float) -> None:
     )
 
 
-def mark_label(image: np.ndarray, label: int, box: np.ndarray) -> None:
+def mark_label(
+    image: np.ndarray,
+    label: str,
+    box: np.ndarray,
+    background_color: tuple[int, int, int] = LABEL_BACKGROUND_COLOR,
+) -> None:
     x = int(min(point[0] for point in box))
     y = int(min(point[1] for point in box))
     y = max(0, y - 6)
@@ -674,7 +711,7 @@ def mark_label(image: np.ndarray, label: int, box: np.ndarray) -> None:
     (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     top_left = (max(0, x), max(text_height + baseline + 2, y) - text_height - baseline - 2)
     bottom_right = (top_left[0] + text_width + 8, top_left[1] + text_height + baseline + 6)
-    cv2.rectangle(image, top_left, bottom_right, LABEL_BACKGROUND_COLOR, -1)
+    cv2.rectangle(image, top_left, bottom_right, background_color, -1)
     cv2.putText(
         image,
         text,
@@ -687,11 +724,50 @@ def mark_label(image: np.ndarray, label: int, box: np.ndarray) -> None:
     )
 
 
-def draw_detection(overlay: np.ndarray, label: int, detection: dict[str, Any]) -> None:
-    box = np.array(detection["rotated_box_px"], dtype=np.int32)
-    cv2.drawContours(overlay, [box], 0, BOUNDING_BOX_COLOR, LINE_THICKNESS)
-    mark_label(overlay, label, box)
-    mark_centroid(overlay, detection["centroid_x_px"], detection["centroid_y_px"])
+def draw_record(overlay: np.ndarray, record: dict[str, Any]) -> None:
+    box = np.array(json.loads(record["rotated_box_px_json"]), dtype=np.int32)
+    if bool(record.get("is_duplicate")):
+        cv2.drawContours(overlay, [box], 0, DUPLICATE_BOX_COLOR, LINE_THICKNESS)
+        mark_label(overlay, "Duplicate", box, DUPLICATE_LABEL_BACKGROUND_COLOR)
+    else:
+        cv2.drawContours(overlay, [box], 0, BOUNDING_BOX_COLOR, LINE_THICKNESS)
+        mark_label(overlay, "Target " + str(int(record["object_index"]) + 1), box)
+    mark_centroid(overlay, float(record["centroid_x_px"]), float(record["centroid_y_px"]))
+
+
+def draw_record_on_context(context: np.ndarray, record: dict[str, Any], context_padding: int) -> None:
+    bbox_x = int(record["bbox_x_px"])
+    bbox_y = int(record["bbox_y_px"])
+    bbox_width = int(record["bbox_width_px"])
+    bbox_height = int(record["bbox_height_px"])
+    source_width = int(record["image_width_px"])
+    source_height = int(record["image_height_px"])
+    x0 = max(0, bbox_x - context_padding)
+    y0 = max(0, bbox_y - context_padding)
+    x1 = min(source_width, bbox_x + bbox_width + context_padding)
+    y1 = min(source_height, bbox_y + bbox_height + context_padding)
+
+    actual_width = max(1, x1 - x0)
+    actual_height = max(1, y1 - y0)
+    scale_x = context.shape[1] / actual_width
+    scale_y = context.shape[0] / actual_height
+
+    original_box = np.array(json.loads(record["rotated_box_px_json"]), dtype=np.float32)
+    box = original_box.copy()
+    box[:, 0] = (box[:, 0] - x0) * scale_x
+    box[:, 1] = (box[:, 1] - y0) * scale_y
+    box = np.intp(box)
+
+    centroid_x = (float(record["centroid_x_px"]) - x0) * scale_x
+    centroid_y = (float(record["centroid_y_px"]) - y0) * scale_y
+
+    if bool(record.get("is_duplicate")):
+        cv2.drawContours(context, [box], 0, DUPLICATE_BOX_COLOR, LINE_THICKNESS)
+        mark_label(context, "Duplicate", box, DUPLICATE_LABEL_BACKGROUND_COLOR)
+    else:
+        cv2.drawContours(context, [box], 0, BOUNDING_BOX_COLOR, LINE_THICKNESS)
+        mark_label(context, "Target " + str(int(record["object_index"]) + 1), box)
+    mark_centroid(context, centroid_x, centroid_y)
 
 
 def write_detection_preview(
@@ -750,6 +826,7 @@ def object_record(
 
     return {
         "object_index": object_index,
+        "candidate_index": object_index,
         "frame_index": frame["frame_index"],
         "camera": frame.get("camera", "Top"),
         "coordinate_transform_version": COORDINATE_TRANSFORM_VERSION,
@@ -801,6 +878,10 @@ def object_record(
 def csv_fields() -> list[str]:
     return [
         "object_index",
+        "candidate_index",
+        "is_duplicate",
+        "duplicate_of_object_index",
+        "duplicate_distance_mm",
         "frame_index",
         "camera",
         "coordinate_transform_version",
@@ -909,7 +990,6 @@ def process_frame(
         objects_file.flush()
         csv_writer.writerow(record)
 
-        draw_detection(overlay, frame_detection_index, detection)
         object_index += 1
 
     cv2.imwrite(str(overlay_path), overlay)
@@ -919,10 +999,100 @@ def process_frame(
     return object_index
 
 
-def rewrite_unique_records(scan_dir: Path, records: list[dict[str, Any]]) -> int:
-    unique_records = deduplicate_records(records, GLOBAL_DEDUPE_DISTANCE_MM)
+def write_all_candidates(scan_dir: Path, records: list[dict[str, Any]]) -> None:
+    candidates_path = scan_dir / "all_candidates.jsonl"
+    with candidates_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def regenerate_overlay_images(scan_dir: Path, records: list[dict[str, Any]]) -> None:
+    records_by_frame: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        records_by_frame.setdefault(int(record["frame_index"]), []).append(record)
+
+    for frame_index, frame_records in records_by_frame.items():
+        source_path = scan_dir / str(frame_records[0]["source_file"])
+        image = cv2.imread(str(source_path))
+        if image is None:
+            continue
+        for record in sorted(frame_records, key=lambda item: bool(item.get("is_duplicate"))):
+            draw_record(image, record)
+        overlay_path = scan_dir / str(frame_records[0]["overlay_file"])
+        cv2.imwrite(str(overlay_path), image)
+
+
+def write_summary_image(scan_dir: Path, records: list[dict[str, Any]]) -> str | None:
+    if not records:
+        return None
+
+    thumb_width = 360
+    thumb_height = 260
+    sorted_records = sorted(
+        records,
+        key=lambda item: (
+            bool(item.get("is_duplicate")),
+            int(item["object_index"]) if not bool(item.get("is_duplicate")) else int(item.get("duplicate_of_object_index") or 999999),
+            int(item["frame_index"]),
+            int(item["candidate_index"]),
+        ),
+    )
+    cols = min(4, max(1, len(sorted_records)))
+    rows = int(np.ceil(len(sorted_records) / cols))
+    summary = np.full((rows * thumb_height, cols * thumb_width, 3), 245, np.uint8)
+
+    for index, record in enumerate(sorted_records):
+        image_path = scan_dir / str(record.get("context_file") or record.get("crop_file"))
+        image = cv2.imread(str(image_path))
+        if image is None:
+            image = np.full((thumb_height, thumb_width, 3), 255, np.uint8)
+        else:
+            draw_record_on_context(image, record, CONTEXT_PADDING_PX)
+        height, width = image.shape[:2]
+        scale = min((thumb_width - 12) / width, (thumb_height - 40) / height)
+        resized = cv2.resize(
+            image,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        tile = np.full((thumb_height, thumb_width, 3), 255, np.uint8)
+        x0 = (thumb_width - resized.shape[1]) // 2
+        y0 = 34 + ((thumb_height - 40 - resized.shape[0]) // 2)
+        tile[y0 : y0 + resized.shape[0], x0 : x0 + resized.shape[1]] = resized
+        if bool(record.get("is_duplicate")):
+            label = "Duplicate of Target " + str(int(record.get("duplicate_of_object_index") or 0) + 1)
+            label_background = DUPLICATE_LABEL_BACKGROUND_COLOR
+        else:
+            label = "Target " + str(int(record["object_index"]) + 1)
+            label_background = LABEL_BACKGROUND_COLOR
+        cv2.rectangle(tile, (0, 0), (thumb_width, 32), label_background, -1)
+        cv2.putText(
+            tile,
+            label,
+            (10, 23),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            LABEL_COLOR,
+            2,
+            cv2.LINE_AA,
+        )
+        row = index // cols
+        col = index % cols
+        summary[row * thumb_height : (row + 1) * thumb_height, col * thumb_width : (col + 1) * thumb_width] = tile
+
+    summary_file = "detection_summary.png"
+    cv2.imwrite(str(scan_dir / summary_file), summary)
+    return summary_file
+
+
+def rewrite_unique_records(scan_dir: Path, records: list[dict[str, Any]]) -> tuple[int, int, str | None]:
+    unique_records = assign_duplicate_metadata(records, GLOBAL_DEDUPE_DISTANCE_MM)
     objects_path = scan_dir / "objects.jsonl"
     csv_path = scan_dir / "objects.csv"
+    duplicate_count = sum(1 for record in records if bool(record.get("is_duplicate")))
+    write_all_candidates(scan_dir, records)
+    regenerate_overlay_images(scan_dir, records)
+    summary_file = write_summary_image(scan_dir, records)
 
     with objects_path.open("w", encoding="utf-8") as objects_file, csv_path.open(
         "w", encoding="utf-8", newline=""
@@ -933,7 +1103,7 @@ def rewrite_unique_records(scan_dir: Path, records: list[dict[str, Any]]) -> int
             objects_file.write(json.dumps(record, sort_keys=True) + "\n")
             csv_writer.writerow(record)
 
-    return len(unique_records)
+    return len(unique_records), duplicate_count, summary_file
 
 
 def scan_is_done(scan_dir: Path, processed_frames: int) -> bool:
@@ -1027,12 +1197,23 @@ def run(args: argparse.Namespace) -> None:
             preview_file=None,
             message="No bug silhouettes detected in this segmentation run",
         )
-    unique_object_count = rewrite_unique_records(scan_dir, all_records) if all_records else 0
-    write_segmentation_complete(scan_dir, unique_object_count, len(processed_keys))
+    unique_object_count = 0
+    duplicate_count = 0
+    summary_file = None
+    if all_records:
+        unique_object_count, duplicate_count, summary_file = rewrite_unique_records(scan_dir, all_records)
+    write_segmentation_complete(
+        scan_dir,
+        unique_object_count,
+        len(processed_keys),
+        object_index,
+        duplicate_count,
+        summary_file,
+    )
 
     print(
         f"Segmented {unique_object_count} unique bug silhouette(s)"
-        f" from {object_index} frame candidate(s)"
+        f" from {object_index} frame candidate(s); marked {duplicate_count} duplicate(s)"
     )
     print(f"Wrote {csv_path}")
     print(f"Wrote {objects_path}")
