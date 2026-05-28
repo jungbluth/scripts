@@ -272,11 +272,20 @@ class HaltControl(tk.Tk):
 
         frame = status.get("frame_index", "-")
         count = status.get("detections_in_frame", "-")
+        duplicates_in_frame = status.get("duplicates_in_frame", 0)
+        unique_object_count = status.get("unique_object_count", "-")
+        duplicate_count = status.get("duplicate_count", "-")
+        label = status.get("label", "")
         score = status.get("score", "-")
         centroid_x = status.get("centroid_x_px", "-")
         centroid_y = status.get("centroid_y_px", "-")
-        self.detection_var.set(f"Latest detection: frame {frame} ({count} in frame)")
+        label_text = f": {label}" if label else ""
+        self.detection_var.set(
+            f"Latest detection{label_text} | frame {frame} "
+            f"({count} in frame, {duplicates_in_frame} duplicate)"
+        )
         self.detection_detail_var.set(
+            f"Unique targets so far: {unique_object_count}   Duplicates so far: {duplicate_count}   "
             f"Centroid: {self._format_number(centroid_x)}, {self._format_number(centroid_y)} px   "
             f"Score: {self._format_number(score)}   Updated: {status.get('updated_at', '-')}"
         )
@@ -294,9 +303,18 @@ class HaltControl(tk.Tk):
             return
 
         try:
-            self.detection_image = tk.PhotoImage(file=str(preview_path))
+            image = tk.PhotoImage(file=str(preview_path))
         except tk.TclError:
             return
+
+        max_width = 520
+        max_height = 293
+        subsample = max(
+            1,
+            int((image.width() + max_width - 1) / max_width),
+            int((image.height() + max_height - 1) / max_height),
+        )
+        self.detection_image = image.subsample(subsample, subsample)
 
         self.detection_preview_path = preview_path
         self.detection_preview_mtime = mtime

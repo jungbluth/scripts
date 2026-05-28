@@ -775,7 +775,8 @@ def write_detection_preview(
     frame: dict[str, Any],
     overlay: np.ndarray,
     overlay_path: Path,
-    detections: list[dict[str, Any]],
+    frame_records: list[dict[str, Any]],
+    all_records: list[dict[str, Any]],
 ) -> None:
     CONTROL_DIR.mkdir(exist_ok=True)
 
@@ -788,7 +789,10 @@ def write_detection_preview(
     )
     cv2.imwrite(str(DETECTION_PREVIEW_FILE), preview)
 
-    strongest = max(detections, key=lambda item: item["score"])
+    strongest = max(frame_records, key=lambda item: float(item["score"]))
+    unique_count = sum(1 for record in all_records if not bool(record.get("is_duplicate")))
+    duplicate_count = sum(1 for record in all_records if bool(record.get("is_duplicate")))
+    frame_duplicate_count = sum(1 for record in frame_records if bool(record.get("is_duplicate")))
     write_detection_status(
         scan_dir,
         "detected",
@@ -796,11 +800,32 @@ def write_detection_preview(
         source_file=frame["file_name"],
         overlay_file=str(overlay_path),
         preview_file=str(DETECTION_PREVIEW_FILE),
-        detections_in_frame=len(detections),
+        detections_in_frame=len(frame_records),
+        duplicates_in_frame=frame_duplicate_count,
+        unique_object_count=unique_count,
+        duplicate_count=duplicate_count,
+        label="Duplicate"
+        if bool(strongest.get("is_duplicate"))
+        else "Target " + str(int(strongest["object_index"]) + 1),
+        duplicate_of_object_index=strongest.get("duplicate_of_object_index"),
         centroid_x_px=strongest["centroid_x_px"],
         centroid_y_px=strongest["centroid_y_px"],
         score=strongest["score"],
     )
+
+
+def draw_records_for_frame(scan_dir: Path, frame_records: list[dict[str, Any]]) -> np.ndarray | None:
+    if not frame_records:
+        return None
+
+    source_path = scan_dir / str(frame_records[0]["source_file"])
+    image = cv2.imread(str(source_path))
+    if image is None:
+        return None
+
+    for record in sorted(frame_records, key=lambda item: bool(item.get("is_duplicate"))):
+        draw_record(image, record)
+    return image
 
 
 def object_record(
@@ -948,7 +973,6 @@ def process_frame(
         return object_index
 
     gray, mask = make_bug_mask(image, args.dark_threshold)
-    overlay = image.copy()
     detections = detect_bugs(
         image,
         gray,
@@ -966,6 +990,7 @@ def process_frame(
     overlay_name = f"frame_{frame['frame_index']:05d}_overlay.png"
     overlay_file = f"overlays/{overlay_name}"
     overlay_path = overlays_dir / overlay_name
+    frame_records: list[dict[str, Any]] = []
 
     for frame_detection_index, detection in enumerate(detections, start=1):
         crop = crop_detection(image, detection, args.crop_padding)
@@ -986,15 +1011,21 @@ def process_frame(
             overlay_file=overlay_file,
         )
         all_records.append(record)
+        frame_records.append(record)
         objects_file.write(json.dumps(record, sort_keys=True) + "\n")
         objects_file.flush()
         csv_writer.writerow(record)
 
         object_index += 1
 
-    cv2.imwrite(str(overlay_path), overlay)
-    if detections:
-        write_detection_preview(scan_dir, frame, overlay, overlay_path, detections)
+    if frame_records:
+        assign_duplicate_metadata(all_records, GLOBAL_DEDUPE_DISTANCE_MM)
+        overlay = draw_records_for_frame(scan_dir, frame_records)
+        if overlay is not None:
+            cv2.imwrite(str(overlay_path), overlay)
+            write_detection_preview(scan_dir, frame, overlay, overlay_path, frame_records, all_records)
+    else:
+        cv2.imwrite(str(overlay_path), image)
 
     return object_index
 

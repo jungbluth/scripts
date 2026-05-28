@@ -142,6 +142,35 @@ with (imports) {
         writeText(statusFile, JSON.stringify(record, null, 2) + '\n');
     }
 
+    function writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY) {
+        var detectionStatusFile = new File(projectDir, 'control/detection_status.json');
+        var previewFile = target.overlayFile && target.overlayFile.length > 0
+            ? new File(scanDir, target.overlayFile)
+            : target.contextFile && target.contextFile.length > 0
+            ? new File(scanDir, target.contextFile)
+            : new File(scanDir, target.cropFile);
+        var record = {
+            status: 'detected',
+            scan_dir: scanDir.getAbsolutePath(),
+            updated_at: new Date().toISOString(),
+            frame_index: target.frameIndex,
+            source_file: target.sourceFile,
+            overlay_file: target.overlayFile,
+            preview_file: previewFile.getAbsolutePath(),
+            detections_in_frame: 1,
+            duplicates_in_frame: 0,
+            unique_object_count: totalTargets,
+            duplicate_count: 0,
+            label: 'Picking Target ' + (targetIndex + 1),
+            centroid_x_px: target.centroidX,
+            centroid_y_px: target.centroidY,
+            score: target.score,
+            pick_x_mm: moveX,
+            pick_y_mm: moveY
+        };
+        writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
+    }
+
     function haltRequested(stopFile, statusFile, scanId, frameIndex, totalFrames) {
         if (!stopFile.exists()) {
             return false;
@@ -1027,7 +1056,7 @@ with (imports) {
         return JSON.parse(text);
     }
 
-    function showDetectionSummaryAndHalt(scanDir, statusFile, scanId, totalFrames) {
+    function showDetectionSummaryAndConfirm(scanDir, statusFile, scanId, totalFrames) {
         var complete = readJsonFile(new File(scanDir, 'segmentation_complete.json'));
         var summaryFile = complete !== null && complete.summary_file
             ? new File(scanDir, String(complete.summary_file))
@@ -1072,17 +1101,17 @@ with (imports) {
                 }
 
                 var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-                var closeButton = new JButton('Close');
-                buttons.add(closeButton);
+                var startButton = new JButton('Start Picking');
+                buttons.add(startButton);
                 panel.add(buttons, BorderLayout.SOUTH);
 
-                function closeAndHalt() {
-                    queue.offer('closed');
+                function startPicking() {
+                    queue.offer('start');
                     frame.dispose();
                 }
 
-                closeButton.addActionListener(new ActionListener({ actionPerformed: function(event) { closeAndHalt(); } }));
-                frame.addWindowListener(new WindowAdapter({ windowClosing: function(event) { closeAndHalt(); } }));
+                startButton.addActionListener(new ActionListener({ actionPerformed: function(event) { startPicking(); } }));
+                frame.addWindowListener(new WindowAdapter({ windowClosing: function(event) { startPicking(); } }));
 
                 frame.setContentPane(panel);
                 frame.pack();
@@ -1093,8 +1122,8 @@ with (imports) {
 
         Packages.javax.swing.SwingUtilities.invokeLater(runnable);
         queue.take();
-        writeStatus(statusFile, 'halted', scanId, totalFrames, totalFrames, 'Detection summary closed by user');
-        print('Detection summary closed. Halting before pick/drop.');
+        print('Detection summary accepted. Starting pick/drop.');
+        return true;
     }
 
     function appendInteractiveReviewRecord(reviewFile, scanReviewFile, scanId, scanDir, target, nozzleName, action, correction, moveX, moveY, recorded, residual) {
@@ -1445,6 +1474,7 @@ with (imports) {
                             targets.push({
                                 objectIndex: record.object_index,
                                 coordinateTransformVersion: String(record.coordinate_transform_version || ''),
+                                frameIndex: Number(record.frame_index || 0),
                                 x: Number(pickX),
                                 y: Number(pickY),
                                 estimatedX: Number(record.estimated_x_mm),
@@ -1466,6 +1496,8 @@ with (imports) {
                                 bboxArea: Number(record.bbox_area_px || 0),
                                 imageWidth: Number(record.image_width_px || 0),
                                 imageHeight: Number(record.image_height_px || 0),
+                                centroidX: Number(record.centroid_x_px || 0),
+                                centroidY: Number(record.centroid_y_px || 0),
                                 score: Number(record.score || 0)
                             });
                         }
@@ -1527,12 +1559,34 @@ with (imports) {
         return unique;
     }
 
+    function wellNameForIndex(index) {
+        var rowIndex = Math.floor(index / 12);
+        var columnIndex = index % 12;
+        return String.fromCharCode('A'.charCodeAt(0) + rowIndex) + String(columnIndex + 1);
+    }
+
+    function wellLocationForIndex(index) {
+        if (index < 0 || index >= 96) {
+            throw new Error('96-well plate only has room for 96 targets; requested well index ' + index);
+        }
+
+        var a1X = 72.4;
+        var a1Y = 238.6;
+        var wellPitch = 9.0;
+        var rowIndex = Math.floor(index / 12);
+        var columnIndex = index % 12;
+
+        return {
+            name: wellNameForIndex(index),
+            x: a1X + (wellPitch * rowIndex),
+            y: a1Y + (wellPitch * columnIndex)
+        };
+    }
+
     function pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames) {
         var pickHeadName = 'H1';
         var pickNozzleName = 'N1';
         var pickNozzleLabel = 'left nozzle N1';
-        var dropX = 100.0;
-        var dropY = 200.0;
         var dryRunFile = new File(projectDir, 'control/pick_dry_run.flag');
         var dryRun = dryRunFile.exists();
         var pickTool = findPickTool(pickHeadName, pickNozzleName);
@@ -1559,6 +1613,9 @@ with (imports) {
             writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan completed; no pick targets found');
             return;
         }
+        if (targets.length > 96) {
+            throw new Error('Refusing pick/drop: found ' + targets.length + ' targets but the plate has 96 wells.');
+        }
 
         for (var i = 0; i < targets.length; i++) {
             if (!waitWhilePaused(pauseFile, stopFile, statusFile, scanId, i, targets.length)
@@ -1570,13 +1627,16 @@ with (imports) {
             var target = targets[i];
             var moveX = target.x + touchCorrection.x;
             var moveY = target.y + touchCorrection.y;
+            var well = wellLocationForIndex(i);
+            writePickingPreview(scanDir, scanId, target, i, targets.length, moveX, moveY);
             writeStatus(
                 statusFile,
                 'picking',
                 scanId,
                 i + 1,
                 targets.length,
-                'Picking target at X ' + moveX.toFixed(3) + ', Y ' + moveY.toFixed(3)
+                'Picking target ' + (i + 1) + ' for well ' + well.name
+                    + ' at X ' + moveX.toFixed(3) + ', Y ' + moveY.toFixed(3)
             );
 
             debugPickTarget(scanDir, target, nozzle, travelZ, dryRun, touchCorrection, moveX, moveY);
@@ -1590,6 +1650,7 @@ with (imports) {
                 + ' Y=' + moveY.toFixed(3)
                 + ' at travel Z=' + travelZ.toFixed(3));
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
+            setVacuum(vacuumActuator, true);
 
             print('Descending to pick object ' + target.objectIndex
                 + ' at X=' + moveX.toFixed(3)
@@ -1597,23 +1658,25 @@ with (imports) {
                 + ' Z=' + pickZ.toFixed(3));
             warnDualNozzleZClearance(pickZ, 'pick descent');
             moveNozzleToXyAtZ(nozzle, moveX, moveY, pickZ);
-            setVacuum(vacuumActuator, true);
+            Packages.java.lang.Thread.sleep(1000);
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
-            print('Moving ' + pickNozzleLabel + ' above drop location for object ' + target.objectIndex
-                + ' at X=' + dropX.toFixed(3)
-                + ' Y=' + dropY.toFixed(3)
+            print('Moving ' + pickNozzleLabel + ' above well ' + well.name
+                + ' for object ' + target.objectIndex
+                + ' at X=' + well.x.toFixed(3)
+                + ' Y=' + well.y.toFixed(3)
                 + ' travel Z=' + travelZ.toFixed(3));
-            moveNozzleToXyAtZ(nozzle, dropX, dropY, travelZ);
+            moveNozzleToXyAtZ(nozzle, well.x, well.y, travelZ);
 
-            print('Descending to drop object ' + target.objectIndex
-                + ' at X=' + dropX.toFixed(3)
-                + ' Y=' + dropY.toFixed(3)
+            print('Descending to place object ' + target.objectIndex
+                + ' into well ' + well.name
+                + ' at X=' + well.x.toFixed(3)
+                + ' Y=' + well.y.toFixed(3)
                 + ' Z=' + dropZ.toFixed(3));
             warnDualNozzleZClearance(dropZ, 'drop descent');
-            moveNozzleToXyAtZ(nozzle, dropX, dropY, dropZ);
+            moveNozzleToXyAtZ(nozzle, well.x, well.y, dropZ);
             setVacuum(vacuumActuator, false);
-            moveNozzleToXyAtZ(nozzle, dropX, dropY, travelZ);
+            moveNozzleToXyAtZ(nozzle, well.x, well.y, travelZ);
         }
 
         writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan and pick/drop sequence completed');
@@ -1806,7 +1869,10 @@ with (imports) {
             if (waitForSegmentation(scanDir, 120000)) {
                 if (interactivePickFile.exists()) {
                     print('Segmentation complete. Showing numbered detection summary.');
-                    showDetectionSummaryAndHalt(scanDir, statusFile, scanId, totalFrames);
+                    if (showDetectionSummaryAndConfirm(scanDir, statusFile, scanId, totalFrames)) {
+                        print('Starting left nozzle N1 pick/drop sequence after summary confirmation.');
+                        pickAndDropTargets(scanDir, pauseFile, stopFile, statusFile, scanId, totalFrames);
+                    }
                 }
                 else if (touchDryRunFile.exists()) {
                     print('Segmentation complete. Starting left nozzle N1 touch calibration sequence.');
