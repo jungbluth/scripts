@@ -1859,7 +1859,7 @@ with (imports) {
         var vacuumActuator = findVacuumActuator(pickTool.head, nozzle);
         var travelZ = nozzle.location.z;
         var touchCorrection = readTouchCorrection();
-        var pickZ = touchCorrection.z + 3.0;
+        var pickZ = touchCorrection.z + 0.5;
         var dropZ = touchCorrection.z;
         var targets = readPickTargets(scanDir);
 
@@ -2095,6 +2095,7 @@ with (imports) {
                     print('Top camera after move: ' + formatLocation(camera.getLocation()));
                     var image = camera.settleAndCapture();
                     var fileName = 'frame_' + pad(frameIndex, 5)
+                        + '_' + timestamp()
                         + '_x' + x.toFixed(2)
                         + '_y' + y.toFixed(2)
                         + '.png';
