@@ -227,19 +227,22 @@ with (imports) {
         var segmentScript = new File(scriptsDir, '02_Segment_Scan_Objects.py').getAbsolutePath();
         var stdoutLog = new File(controlDir, 'segmentation.out.log');
         var stderrLog = new File(controlDir, 'segmentation.err.log');
+        var detectorMode = new File(controlDir, 'bug_detector.flag').exists() ? 'bug' : 'resistor';
 
         try {
             var builder = new Packages.java.lang.ProcessBuilder(
                 python,
                 segmentScript,
                 scanDir.getAbsolutePath(),
+                '--detector',
+                detectorMode,
                 '--watch'
             );
             builder.directory(projectDir);
             builder.redirectOutput(stdoutLog);
             builder.redirectError(stderrLog);
             builder.start();
-            print('Launched segmentation for: ' + scanDir.getAbsolutePath());
+            print('Launched ' + detectorMode + ' segmentation for: ' + scanDir.getAbsolutePath());
         }
         catch (error) {
             print('Failed to launch segmentation: ' + error);
@@ -1375,6 +1378,103 @@ with (imports) {
         Packages.java.lang.Thread.sleep(200);
     }
 
+    function readVacuumLevel(vacuumActuator) {
+        var value = null;
+        try {
+            value = vacuumActuator.read();
+        }
+        catch (readError) {
+            try {
+                value = vacuumActuator.readDouble();
+            }
+            catch (readDoubleError) {
+                try {
+                    value = vacuumActuator.getLastValue();
+                }
+                catch (lastValueError) {
+                    print('Could not read vacuum pressure from actuator '
+                        + vacuumActuator.getName() + ': ' + readError
+                        + '; ' + readDoubleError + '; ' + lastValueError);
+                    return null;
+                }
+            }
+        }
+
+        if (value === null || value === undefined) {
+            return null;
+        }
+        var numeric = Number(value);
+        if (isNaN(numeric)) {
+            print('Vacuum pressure read was non-numeric: ' + value);
+            return null;
+        }
+        return numeric;
+    }
+
+    function vacuumIndicatesPartOn(vacuumLevel) {
+        if (vacuumLevel === null) {
+            return null;
+        }
+        return vacuumLevel >= 206.0 && vacuumLevel <= 226.5;
+    }
+
+    function pickWithVacuumCheck(nozzle, vacuumActuator, moveX, moveY, travelZ, pickZ, targetIndex, statusFile, scanId, totalTargets) {
+        var retryStepMm = 0.5;
+        var maxAttempts = 3;
+        var readableVacuum = true;
+
+        setVacuum(vacuumActuator, true);
+        for (var attempt = 0; attempt < maxAttempts; attempt++) {
+            var attemptZ = pickZ - (retryStepMm * attempt);
+            warnDualNozzleZClearance(attemptZ, 'pick descent attempt ' + (attempt + 1));
+            print('Pick attempt ' + (attempt + 1) + ' for target ' + (targetIndex + 1)
+                + ' at X=' + moveX.toFixed(3)
+                + ' Y=' + moveY.toFixed(3)
+                + ' Z=' + attemptZ.toFixed(3));
+            moveNozzleToXyAtZ(nozzle, moveX, moveY, attemptZ);
+            Packages.java.lang.Thread.sleep(1000);
+
+            var vacuumLevel = readVacuumLevel(vacuumActuator);
+            var partOn = vacuumIndicatesPartOn(vacuumLevel);
+            if (partOn === null) {
+                readableVacuum = false;
+                print('Vacuum pressure unavailable; continuing without pressure-based retry.');
+                break;
+            }
+
+            print('Vacuum pressure after pick attempt ' + (attempt + 1)
+                + ': ' + vacuumLevel.toFixed(3)
+                + ' part-on=' + partOn);
+            if (partOn) {
+                return {
+                    success: true,
+                    z: attemptZ,
+                    vacuumLevel: vacuumLevel,
+                    attempts: attempt + 1
+                };
+            }
+
+            if (attempt + 1 < maxAttempts) {
+                writeStatus(
+                    statusFile,
+                    'picking',
+                    scanId,
+                    targetIndex + 1,
+                    totalTargets,
+                    'Vacuum did not confirm target ' + (targetIndex + 1)
+                        + '; retrying 0.5mm lower'
+                );
+            }
+        }
+
+        return {
+            success: !readableVacuum,
+            z: pickZ - (retryStepMm * (readableVacuum ? maxAttempts - 1 : 0)),
+            vacuumLevel: null,
+            attempts: readableVacuum ? maxAttempts : 1
+        };
+    }
+
     function n2ZWhenN1Z(n1Z) {
         return 11.2 - n1Z;
     }
@@ -1594,7 +1694,7 @@ with (imports) {
         var vacuumActuator = findVacuumActuator(pickTool.head, nozzle);
         var travelZ = nozzle.location.z;
         var touchCorrection = readTouchCorrection();
-        var pickZ = touchCorrection.z;
+        var pickZ = touchCorrection.z - 1.0;
         var dropZ = touchCorrection.z;
         var targets = readPickTargets(scanDir);
 
@@ -1650,15 +1750,27 @@ with (imports) {
                 + ' Y=' + moveY.toFixed(3)
                 + ' at travel Z=' + travelZ.toFixed(3));
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
-            setVacuum(vacuumActuator, true);
 
-            print('Descending to pick object ' + target.objectIndex
+            print('Starting pressure-checked pick for object ' + target.objectIndex
                 + ' at X=' + moveX.toFixed(3)
                 + ' Y=' + moveY.toFixed(3)
-                + ' Z=' + pickZ.toFixed(3));
-            warnDualNozzleZClearance(pickZ, 'pick descent');
-            moveNozzleToXyAtZ(nozzle, moveX, moveY, pickZ);
-            Packages.java.lang.Thread.sleep(1000);
+                + ' initial Z=' + pickZ.toFixed(3));
+            var pickResult = pickWithVacuumCheck(
+                nozzle,
+                vacuumActuator,
+                moveX,
+                moveY,
+                travelZ,
+                pickZ,
+                i,
+                statusFile,
+                scanId,
+                targets.length
+            );
+            if (!pickResult.success) {
+                print('Warning: vacuum did not confirm target ' + (i + 1)
+                    + ' after ' + pickResult.attempts + ' attempt(s). Continuing to place attempt.');
+            }
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
             print('Moving ' + pickNozzleLabel + ' above well ' + well.name

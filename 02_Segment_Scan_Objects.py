@@ -46,6 +46,16 @@ MAX_ASPECT_RATIO = 5.00
 MAX_INSIDE_MEAN_INTENSITY = 165
 MIN_BACKGROUND_CONTRAST = 25
 FIXED_DARK_THRESHOLD = 70
+RESISTOR_MIN_AREA_PX = 120
+RESISTOR_MAX_AREA_FRACTION = 0.01
+RESISTOR_MAX_RECT_AREA_FRACTION = 0.012
+RESISTOR_MAX_SHORT_SIDE_FRACTION = 0.08
+RESISTOR_MAX_LONG_SIDE_FRACTION = 0.16
+RESISTOR_MIN_RECTANGULARITY = 0.55
+RESISTOR_MIN_ASPECT_RATIO = 1.15
+RESISTOR_MAX_ASPECT_RATIO = 6.00
+RESISTOR_MAX_INSIDE_MEAN_INTENSITY = 115
+RESISTOR_MIN_BACKGROUND_CONTRAST = 18
 CLOSE_KERNEL_SIZE = 13
 OPEN_KERNEL_SIZE = 2
 PINK_MIN_SATURATION = 60
@@ -110,12 +120,14 @@ def write_segmentation_complete(
     candidate_count: int,
     duplicate_count: int,
     summary_file: str | None,
+    detector: str,
 ) -> None:
     complete_path = scan_dir / "segmentation_complete.json"
     payload = {
         "status": "completed",
         "scan_dir": str(scan_dir),
         "object_count": object_count,
+        "detector": detector,
         "candidate_count": candidate_count,
         "duplicate_count": duplicate_count,
         "summary_file": summary_file,
@@ -854,6 +866,7 @@ def object_record(
         "candidate_index": object_index,
         "frame_index": frame["frame_index"],
         "camera": frame.get("camera", "Top"),
+        "detector": detection.get("detector", ""),
         "coordinate_transform_version": COORDINATE_TRANSFORM_VERSION,
         "source_file": frame["file_name"],
         "crop_file": crop_file,
@@ -909,6 +922,7 @@ def csv_fields() -> list[str]:
         "duplicate_distance_mm",
         "frame_index",
         "camera",
+        "detector",
         "coordinate_transform_version",
         "source_file",
         "crop_file",
@@ -955,6 +969,32 @@ def csv_fields() -> list[str]:
     ]
 
 
+def detect_resistors(
+    gray: np.ndarray,
+    dark_threshold: int,
+) -> list[dict[str, Any]]:
+    dark_mask = make_dark_mask(gray, dark_threshold)
+    edge_mask = make_edge_mask(gray)
+    detections = detect_rectangles(
+        gray,
+        dark_mask,
+        edge_mask,
+        min_area_px=RESISTOR_MIN_AREA_PX,
+        max_area_fraction=RESISTOR_MAX_AREA_FRACTION,
+        max_rect_area_fraction=RESISTOR_MAX_RECT_AREA_FRACTION,
+        max_short_side_fraction=RESISTOR_MAX_SHORT_SIDE_FRACTION,
+        max_long_side_fraction=RESISTOR_MAX_LONG_SIDE_FRACTION,
+        min_rectangularity=RESISTOR_MIN_RECTANGULARITY,
+        min_aspect_ratio=RESISTOR_MIN_ASPECT_RATIO,
+        max_aspect_ratio=RESISTOR_MAX_ASPECT_RATIO,
+        max_inside_mean_intensity=RESISTOR_MAX_INSIDE_MEAN_INTENSITY,
+        min_background_contrast=RESISTOR_MIN_BACKGROUND_CONTRAST,
+    )
+    for detection in detections:
+        detection["detection_method"] = "resistor_" + str(detection["detection_method"])
+    return detections
+
+
 def process_frame(
     scan_dir: Path,
     frame: dict[str, Any],
@@ -972,21 +1012,27 @@ def process_frame(
         print(f"Skipping unreadable image: {image_path}", file=sys.stderr)
         return object_index
 
-    gray, mask = make_bug_mask(image, args.dark_threshold)
-    detections = detect_bugs(
-        image,
-        gray,
-        mask,
-        min_area_px=args.min_area,
-        max_area_fraction=args.max_area_fraction,
-        max_short_side_fraction=args.max_short_side_fraction,
-        max_long_side_fraction=args.max_long_side_fraction,
-        min_rectangularity=args.min_rectangularity,
-        min_aspect_ratio=args.min_aspect_ratio,
-        max_aspect_ratio=args.max_aspect_ratio,
-        max_inside_mean_intensity=args.max_inside_mean_intensity,
-        min_background_contrast=args.min_background_contrast,
-    )
+    if args.detector == "bug":
+        gray, mask = make_bug_mask(image, args.dark_threshold)
+        detections = detect_bugs(
+            image,
+            gray,
+            mask,
+            min_area_px=args.min_area,
+            max_area_fraction=args.max_area_fraction,
+            max_short_side_fraction=args.max_short_side_fraction,
+            max_long_side_fraction=args.max_long_side_fraction,
+            min_rectangularity=args.min_rectangularity,
+            min_aspect_ratio=args.min_aspect_ratio,
+            max_aspect_ratio=args.max_aspect_ratio,
+            max_inside_mean_intensity=args.max_inside_mean_intensity,
+            min_background_contrast=args.min_background_contrast,
+        )
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        detections = detect_resistors(gray, args.dark_threshold)
+    for detection in detections:
+        detection["detector"] = args.detector
     overlay_name = f"frame_{frame['frame_index']:05d}_overlay.png"
     overlay_file = f"overlays/{overlay_name}"
     overlay_path = overlays_dir / overlay_name
@@ -1177,7 +1223,8 @@ def run(args: argparse.Namespace) -> None:
         "processing",
         frame_index=None,
         preview_file=None,
-        message="Segmenting scan images",
+        detector=args.detector,
+        message=f"Segmenting scan images with {args.detector} detector",
     )
 
     with objects_path.open("w", encoding="utf-8") as objects_file, csv_path.open(
@@ -1226,7 +1273,7 @@ def run(args: argparse.Namespace) -> None:
             "none_found",
             frame_index=max((key[0] for key in processed_keys), default=None),
             preview_file=None,
-            message="No bug silhouettes detected in this segmentation run",
+            message=f"No {args.detector} targets detected in this segmentation run",
         )
     unique_object_count = 0
     duplicate_count = 0
@@ -1240,10 +1287,12 @@ def run(args: argparse.Namespace) -> None:
         object_index,
         duplicate_count,
         summary_file,
+        args.detector,
     )
 
+    target_label = "resistor component" if args.detector == "resistor" else "bug silhouette"
     print(
-        f"Segmented {unique_object_count} unique bug silhouette(s)"
+        f"Segmented {unique_object_count} unique {target_label}(s)"
         f" from {object_index} frame candidate(s); marked {duplicate_count} duplicate(s)"
     )
     print(f"Wrote {csv_path}")
@@ -1253,6 +1302,12 @@ def run(args: argparse.Namespace) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("scan_dir", type=Path)
+    parser.add_argument(
+        "--detector",
+        choices=("resistor", "bug"),
+        default="resistor",
+        help="Target detector to use. 'resistor' finds small black rectangles; 'bug' restores silhouette detection.",
+    )
     parser.add_argument("--min-area", type=int, default=MIN_AREA_PX)
     parser.add_argument("--max-area-fraction", type=float, default=MAX_AREA_FRACTION)
     parser.add_argument("--max-rect-area-fraction", type=float, default=MAX_RECT_AREA_FRACTION)
