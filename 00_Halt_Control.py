@@ -279,16 +279,41 @@ class HaltControl(tk.Tk):
         score = status.get("score", "-")
         centroid_x = status.get("centroid_x_px", "-")
         centroid_y = status.get("centroid_y_px", "-")
+        pressure_parts = []
+        if "vacuum_level" in status:
+            level = status.get("vacuum_level")
+            if level is None:
+                pressure_parts.append("Vacuum: unreadable")
+            else:
+                pressure_parts.append(f"Vacuum: {self._format_number(level)}")
+
+            part_on = status.get("vacuum_part_on")
+            if part_on is True:
+                pressure_parts.append("part detected")
+            elif part_on is False:
+                pressure_parts.append("no part detected")
+
+            attempt = status.get("vacuum_attempt")
+            if attempt not in (None, ""):
+                pressure_parts.append(f"attempt {attempt}")
+
+            pick_z = status.get("pick_z_mm")
+            if pick_z not in (None, ""):
+                pressure_parts.append(f"Z {self._format_number(pick_z)} mm")
+
         label_text = f": {label}" if label else ""
         self.detection_var.set(
             f"Latest detection{label_text} | frame {frame} "
             f"({count} in frame, {duplicates_in_frame} duplicate)"
         )
-        self.detection_detail_var.set(
+        detail = (
             f"Unique targets so far: {unique_object_count}   Duplicates so far: {duplicate_count}   "
             f"Centroid: {self._format_number(centroid_x)}, {self._format_number(centroid_y)} px   "
             f"Score: {self._format_number(score)}   Updated: {status.get('updated_at', '-')}"
         )
+        if pressure_parts:
+            detail = f"{detail}\n" + "   ".join(pressure_parts)
+        self.detection_detail_var.set(detail)
 
         preview = status.get("preview_file")
         if not preview or self.detection_image_label is None:

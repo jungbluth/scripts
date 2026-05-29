@@ -142,7 +142,7 @@ with (imports) {
         writeText(statusFile, JSON.stringify(record, null, 2) + '\n');
     }
 
-    function writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY) {
+    function writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY, extraFields) {
         var detectionStatusFile = new File(projectDir, 'control/detection_status.json');
         var previewFile = target.overlayFile && target.overlayFile.length > 0
             ? new File(scanDir, target.overlayFile)
@@ -168,6 +168,13 @@ with (imports) {
             pick_x_mm: moveX,
             pick_y_mm: moveY
         };
+        if (extraFields) {
+            for (var key in extraFields) {
+                if (extraFields.hasOwnProperty(key)) {
+                    record[key] = extraFields[key];
+                }
+            }
+        }
         writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
     }
 
@@ -1418,7 +1425,7 @@ with (imports) {
         return vacuumLevel >= 206.0 && vacuumLevel <= 226.5;
     }
 
-    function pickWithVacuumCheck(nozzle, vacuumActuator, moveX, moveY, travelZ, pickZ, targetIndex, statusFile, scanId, totalTargets) {
+    function pickWithVacuumCheck(scanDir, target, nozzle, vacuumActuator, moveX, moveY, travelZ, pickZ, targetIndex, statusFile, scanId, totalTargets) {
         var retryStepMm = 0.5;
         var maxAttempts = 3;
         var readableVacuum = true;
@@ -1439,12 +1446,28 @@ with (imports) {
             if (partOn === null) {
                 readableVacuum = false;
                 print('Vacuum pressure unavailable; continuing without pressure-based retry.');
+                writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY, {
+                    label: 'Picking Target ' + (targetIndex + 1) + ' | Vacuum unreadable',
+                    vacuum_level: null,
+                    vacuum_part_on: null,
+                    vacuum_attempt: attempt + 1,
+                    pick_z_mm: attemptZ
+                });
                 break;
             }
 
             print('Vacuum pressure after pick attempt ' + (attempt + 1)
                 + ': ' + vacuumLevel.toFixed(3)
                 + ' part-on=' + partOn);
+            writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY, {
+                label: 'Picking Target ' + (targetIndex + 1)
+                    + ' | Vacuum ' + vacuumLevel.toFixed(1)
+                    + (partOn ? ' part on' : ' no part'),
+                vacuum_level: vacuumLevel,
+                vacuum_part_on: partOn,
+                vacuum_attempt: attempt + 1,
+                pick_z_mm: attemptZ
+            });
             if (partOn) {
                 return {
                     success: true,
@@ -1473,6 +1496,12 @@ with (imports) {
             vacuumLevel: null,
             attempts: readableVacuum ? maxAttempts : 1
         };
+    }
+
+    function releasePartIntoWell(vacuumActuator) {
+        setVacuum(vacuumActuator, false);
+        print('Vacuum off at well; holding 0.5s release dwell. VAC1 is configured as a Boolean actuator, so no reverse command was sent.');
+        Packages.java.lang.Thread.sleep(500);
     }
 
     function n2ZWhenN1Z(n1Z) {
@@ -1756,6 +1785,8 @@ with (imports) {
                 + ' Y=' + moveY.toFixed(3)
                 + ' initial Z=' + pickZ.toFixed(3));
             var pickResult = pickWithVacuumCheck(
+                scanDir,
+                target,
                 nozzle,
                 vacuumActuator,
                 moveX,
@@ -1787,7 +1818,7 @@ with (imports) {
                 + ' Z=' + dropZ.toFixed(3));
             warnDualNozzleZClearance(dropZ, 'drop descent');
             moveNozzleToXyAtZ(nozzle, well.x, well.y, dropZ);
-            setVacuum(vacuumActuator, false);
+            releasePartIntoWell(vacuumActuator);
             moveNozzleToXyAtZ(nozzle, well.x, well.y, travelZ);
         }
 
