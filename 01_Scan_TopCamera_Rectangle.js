@@ -110,6 +110,49 @@ with (imports) {
         }
     }
 
+    function findCameraByName(name) {
+        function cameraMatches(camera) {
+            return camera && String(camera.getName()) === name;
+        }
+
+        try {
+            if (cameraMatches(machine.defaultHead.defaultCamera)) {
+                return machine.defaultHead.defaultCamera;
+            }
+        }
+        catch (defaultError) {
+            print('Could not check default head camera for ' + name + ': ' + defaultError);
+        }
+
+        try {
+            var headCameras = machine.defaultHead.getCameras();
+            for (var headIndex = 0; headIndex < headCameras.size(); headIndex++) {
+                var headCamera = headCameras.get(headIndex);
+                if (cameraMatches(headCamera)) {
+                    return headCamera;
+                }
+            }
+        }
+        catch (headError) {
+            print('Could not enumerate head cameras while looking for ' + name + ': ' + headError);
+        }
+
+        try {
+            var machineCameras = machine.getCameras();
+            for (var machineIndex = 0; machineIndex < machineCameras.size(); machineIndex++) {
+                var machineCamera = machineCameras.get(machineIndex);
+                if (cameraMatches(machineCamera)) {
+                    return machineCamera;
+                }
+            }
+        }
+        catch (machineError) {
+            print('Could not enumerate machine cameras while looking for ' + name + ': ' + machineError);
+        }
+
+        throw new Error('Camera not found: ' + name);
+    }
+
     function writeText(file, text) {
         var writer = new FileWriter(file);
         try {
@@ -175,6 +218,30 @@ with (imports) {
                 }
             }
         }
+        writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
+    }
+
+    function writeInspectionPreview(scanDir, scanId, target, targetIndex, totalTargets, imageFile, x, y, z) {
+        var detectionStatusFile = new File(projectDir, 'control/detection_status.json');
+        var record = {
+            status: 'detected',
+            scan_dir: scanDir.getAbsolutePath(),
+            updated_at: new Date().toISOString(),
+            frame_index: target.frameIndex,
+            source_file: imageFile.getName(),
+            preview_file: imageFile.getAbsolutePath(),
+            detections_in_frame: 1,
+            duplicates_in_frame: 0,
+            unique_object_count: totalTargets,
+            duplicate_count: 0,
+            label: 'Bottom inspection Target ' + (targetIndex + 1),
+            centroid_x_px: target.centroidX,
+            centroid_y_px: target.centroidY,
+            score: target.score,
+            inspection_x_mm: x,
+            inspection_y_mm: y,
+            inspection_z_mm: z
+        };
         writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
     }
 
@@ -1498,6 +1565,75 @@ with (imports) {
         };
     }
 
+    function pickAssumingSuccess(scanDir, target, nozzle, vacuumActuator, moveX, moveY, pickZ, targetIndex, scanId, totalTargets) {
+        warnDualNozzleZClearance(pickZ, 'net-tray pick descent');
+        writePickingPreview(scanDir, scanId, target, targetIndex, totalTargets, moveX, moveY, {
+            label: 'Picking Target ' + (targetIndex + 1) + ' | assumed pickup',
+            pick_z_mm: pickZ
+        });
+        setVacuum(vacuumActuator, true);
+        print('Assumed-success net-tray pick for target ' + (targetIndex + 1)
+            + ' at X=' + moveX.toFixed(3)
+            + ' Y=' + moveY.toFixed(3)
+            + ' Z=' + pickZ.toFixed(3));
+        moveNozzleToXyAtZ(nozzle, moveX, moveY, pickZ);
+        Packages.java.lang.Thread.sleep(1000);
+        return {
+            success: true,
+            z: pickZ,
+            vacuumLevel: null,
+            attempts: 1
+        };
+    }
+
+    function inspectPickedTargetOnBottomCamera(scanDir, scanId, target, targetIndex, totalTargets, nozzle, travelZ) {
+        var bottomCamera = findCameraByName('Bottom');
+        var bottomLocation = bottomCamera.getLocation();
+        var inspectionZ = -75.0;
+        var n2ToN1BottomCameraOffsetX = 45.905;
+        var n2ToN1BottomCameraOffsetY = 0.994;
+        var inspectionX = bottomLocation.x + n2ToN1BottomCameraOffsetX;
+        var inspectionY = bottomLocation.y + n2ToN1BottomCameraOffsetY;
+        var inspectionDir = new File(scanDir, 'bottom_inspections');
+        inspectionDir.mkdirs();
+
+        var imageName = 'target_' + pad(targetIndex + 1, 3)
+            + '_object_' + pad(target.objectIndex, 6)
+            + '_' + timestamp()
+            + '_bottom.png';
+        var imageFile = new File(inspectionDir, imageName);
+
+        print('Moving N1 to Bottom camera for target ' + (targetIndex + 1)
+            + ' at X=' + inspectionX.toFixed(3)
+            + ' Y=' + inspectionY.toFixed(3)
+            + ' (Bottom camera location plus N2->N1 offset dX='
+            + n2ToN1BottomCameraOffsetX.toFixed(3)
+            + ' dY=' + n2ToN1BottomCameraOffsetY.toFixed(3) + ')'
+            + ' travel Z=' + travelZ.toFixed(3)
+            + ' inspection Z=' + inspectionZ.toFixed(3));
+        moveNozzleToXyAtZ(nozzle, inspectionX, inspectionY, travelZ);
+        warnDualNozzleZClearance(inspectionZ, 'bottom-camera inspection descent');
+        moveNozzleToXyAtZ(nozzle, inspectionX, inspectionY, inspectionZ);
+        Packages.java.lang.Thread.sleep(500);
+
+        var image = bottomCamera.settleAndCapture();
+        ImageIO.write(image, 'PNG', imageFile);
+        print('Saved bottom-camera inspection image: ' + imageFile.getAbsolutePath());
+        writeInspectionPreview(
+            scanDir,
+            scanId,
+            target,
+            targetIndex,
+            totalTargets,
+            imageFile,
+            inspectionX,
+            inspectionY,
+            inspectionZ
+        );
+        moveNozzleToXyAtZ(nozzle, inspectionX, inspectionY, travelZ);
+        return imageFile;
+    }
+
     function releasePartIntoWell(vacuumActuator) {
         setVacuum(vacuumActuator, false);
         print('Vacuum off at well; holding 0.5s release dwell. VAC1 is configured as a Boolean actuator, so no reverse command was sent.');
@@ -1723,7 +1859,7 @@ with (imports) {
         var vacuumActuator = findVacuumActuator(pickTool.head, nozzle);
         var travelZ = nozzle.location.z;
         var touchCorrection = readTouchCorrection();
-        var pickZ = touchCorrection.z - 1.0;
+        var pickZ = touchCorrection.z + 3.0;
         var dropZ = touchCorrection.z;
         var targets = readPickTargets(scanDir);
 
@@ -1780,29 +1916,33 @@ with (imports) {
                 + ' at travel Z=' + travelZ.toFixed(3));
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
 
-            print('Starting pressure-checked pick for object ' + target.objectIndex
+            print('Starting assumed-success net-tray pick for object ' + target.objectIndex
                 + ' at X=' + moveX.toFixed(3)
                 + ' Y=' + moveY.toFixed(3)
-                + ' initial Z=' + pickZ.toFixed(3));
-            var pickResult = pickWithVacuumCheck(
+                + ' Z=' + pickZ.toFixed(3));
+            pickAssumingSuccess(
                 scanDir,
                 target,
                 nozzle,
                 vacuumActuator,
                 moveX,
                 moveY,
-                travelZ,
                 pickZ,
                 i,
-                statusFile,
                 scanId,
                 targets.length
             );
-            if (!pickResult.success) {
-                print('Warning: vacuum did not confirm target ' + (i + 1)
-                    + ' after ' + pickResult.attempts + ' attempt(s). Continuing to place attempt.');
-            }
             moveNozzleToXyAtZ(nozzle, moveX, moveY, travelZ);
+
+            inspectPickedTargetOnBottomCamera(
+                scanDir,
+                scanId,
+                target,
+                i,
+                targets.length,
+                nozzle,
+                travelZ
+            );
 
             print('Moving ' + pickNozzleLabel + ' above well ' + well.name
                 + ' for object ' + target.objectIndex
@@ -1828,7 +1968,7 @@ with (imports) {
     task(function() {
         var camera = machine.defaultHead.defaultCamera;
         if (camera.getName() !== 'Top') {
-            camera = machine.getCameraByName('Top');
+            camera = findCameraByName('Top');
         }
         parkNozzlesForScan(machine.defaultHead);
 
