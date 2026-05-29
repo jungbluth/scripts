@@ -59,18 +59,20 @@ RESISTOR_MIN_BACKGROUND_CONTRAST = 18
 CLOSE_KERNEL_SIZE = 13
 OPEN_KERNEL_SIZE = 2
 PINK_MIN_SATURATION = 60
-PINK_MIN_VALUE = 65
+PINK_MIN_VALUE = 135
 PINK_DILATE_KERNEL_SIZE = 15
-PINK_RED_DOMINANCE = 18
+PINK_RED_DOMINANCE = 12
+PINK_MIN_HUE = 135
 BUG_MIN_FILL_RATIO = 0.04
 IMAGE_EDGE_REJECT_MARGIN_PX = 40
 COLOR_PRESENT_SATURATION_P99 = 20
-COLOR_MIN_AREA_PX = 5000
+COLOR_MIN_AREA_PX = 1500
 COLOR_MAX_AXIS_ASPECT_RATIO = 3.5
-COLOR_MAX_INSIDE_MEAN_INTENSITY = 90
+COLOR_MAX_INSIDE_MEAN_INTENSITY = 170
 COLOR_MIN_RECTANGULARITY = 0.20
 COLOR_MAX_SHORT_SIDE_FRACTION = 0.42
 COLOR_MAX_LONG_SIDE_FRACTION = 0.48
+COLOR_MIN_BACKGROUND_CONTRAST = -15
 GLOBAL_DEDUPE_DISTANCE_MM = 6.0
 CONTEXT_PADDING_PX = 900
 COORDINATE_TRANSFORM_VERSION = "image_y_inverted_v2"
@@ -184,6 +186,7 @@ def make_pink_mask(image: np.ndarray) -> np.ndarray:
     red_dominant_pink = (
         (saturation >= PINK_MIN_SATURATION)
         & (value >= PINK_MIN_VALUE)
+        & (hue >= PINK_MIN_HUE)
         & (red - np.maximum(green, blue) >= PINK_RED_DOMINANCE)
     )
     pink_pixels = red_dominant_pink
@@ -202,7 +205,15 @@ def make_pink_mask(image: np.ndarray) -> np.ndarray:
 def make_bug_mask(image: np.ndarray, threshold: int) -> tuple[np.ndarray, np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, dark_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    color_present = float(np.percentile(saturation, 99)) >= COLOR_PRESENT_SATURATION_P99
+    if color_present:
+        dark_pixels = (blurred < max(threshold, 165)) & (saturation > 25)
+        very_dark_pixels = blurred < 100
+        dark_mask = ((dark_pixels | very_dark_pixels).astype(np.uint8)) * 255
+    else:
+        _, dark_mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
     pink_mask = make_pink_mask(image)
     mask = cv2.bitwise_and(dark_mask, cv2.bitwise_not(pink_mask))
     mask = cv2.morphologyEx(
@@ -487,6 +498,11 @@ def detect_bugs(
         if color_present
         else min(max_inside_mean_intensity, GRAYSCALE_MAX_INSIDE_MEAN_INTENSITY)
     )
+    effective_min_background_contrast = (
+        min(min_background_contrast, COLOR_MIN_BACKGROUND_CONTRAST)
+        if color_present
+        else min_background_contrast
+    )
     effective_max_short_side_fraction = (
         max(max_short_side_fraction, COLOR_MAX_SHORT_SIDE_FRACTION)
         if color_present
@@ -541,7 +557,7 @@ def detect_bugs(
         mean_intensity, background_mean, contrast = contour_contrast(gray, contour)
         if mean_intensity > effective_max_inside_mean:
             continue
-        if contrast < min_background_contrast:
+        if contrast < effective_min_background_contrast:
             continue
 
         rect = cv2.minAreaRect(contour)
