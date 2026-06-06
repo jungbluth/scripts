@@ -301,6 +301,22 @@ class HaltControl(tk.Tk):
             if pick_z not in (None, ""):
                 pressure_parts.append(f"Z {self._format_number(pick_z)} mm")
 
+        qa_parts = []
+        if "qa_mode" in status:
+            qa_parts.append(f"QA: {status.get('qa_mode')}")
+            if status.get("qa_well_empty") is True:
+                qa_parts.append("well empty")
+            elif status.get("qa_well_empty") is False:
+                qa_parts.append("well occupied")
+            if status.get("qa_bug_present") is True:
+                qa_parts.append("bug present")
+            elif status.get("qa_bug_present") is False:
+                qa_parts.append("no bug detected")
+            if "qa_largest_area_px" in status:
+                qa_parts.append(f"largest area {self._format_number(status.get('qa_largest_area_px'))} px")
+            if "qa_dark_fraction" in status:
+                qa_parts.append(f"dark fraction {self._format_number(status.get('qa_dark_fraction'))}")
+
         label_text = f": {label}" if label else ""
         self.detection_var.set(
             f"Latest detection{label_text} | frame {frame} "
@@ -313,6 +329,8 @@ class HaltControl(tk.Tk):
         )
         if pressure_parts:
             detail = f"{detail}\n" + "   ".join(pressure_parts)
+        if qa_parts:
+            detail = f"{detail}\n" + "   ".join(qa_parts)
         self.detection_detail_var.set(detail)
 
         preview = status.get("preview_file")

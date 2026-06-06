@@ -163,6 +163,22 @@ with (imports) {
         }
     }
 
+    function readText(file) {
+        var reader = new BufferedReader(new FileReader(file));
+        var lines = [];
+        try {
+            var line = reader.readLine();
+            while (line !== null) {
+                lines.push(String(line));
+                line = reader.readLine();
+            }
+        }
+        finally {
+            reader.close();
+        }
+        return lines.join('\n');
+    }
+
     function appendText(file, text) {
         var writer = new FileWriter(file, true);
         try {
@@ -242,6 +258,37 @@ with (imports) {
             inspection_y_mm: y,
             inspection_z_mm: z
         };
+        writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
+    }
+
+    function writeQaPreview(scanDir, scanId, target, targetIndex, totalTargets, imageFile, label, x, y, z, result) {
+        var detectionStatusFile = new File(projectDir, 'control/detection_status.json');
+        var record = {
+            status: 'detected',
+            scan_dir: scanDir.getAbsolutePath(),
+            updated_at: new Date().toISOString(),
+            frame_index: target.frameIndex,
+            source_file: imageFile.getName(),
+            preview_file: imageFile.getAbsolutePath(),
+            detections_in_frame: 1,
+            duplicates_in_frame: 0,
+            unique_object_count: totalTargets,
+            duplicate_count: 0,
+            label: label,
+            centroid_x_px: target.centroidX,
+            centroid_y_px: target.centroidY,
+            score: target.score,
+            qa_x_mm: x,
+            qa_y_mm: y,
+            qa_z_mm: z
+        };
+        if (result) {
+            record.qa_mode = result.mode;
+            record.qa_well_empty = result.well_empty;
+            record.qa_bug_present = result.bug_present;
+            record.qa_dark_fraction = result.dark_fraction;
+            record.qa_largest_area_px = result.largest_area_px;
+        }
         writeText(detectionStatusFile, JSON.stringify(record, null, 2) + '\n');
     }
 
@@ -1634,6 +1681,166 @@ with (imports) {
         return imageFile;
     }
 
+    function runQaInspection(scanDir, imageFile, mode, targetIndex) {
+        var qaScript = new File(scriptsDir, '03_QA_Inspect_Image.py').getAbsolutePath();
+        var qaDir = new File(scanDir, 'qa');
+        qaDir.mkdirs();
+        var resultFile = new File(qaDir, mode + '_target_' + pad(targetIndex + 1, 3)
+            + '_' + timestamp() + '.json');
+        var stdoutLog = new File(qaDir, 'qa_' + mode + '.out.log');
+        var stderrLog = new File(qaDir, 'qa_' + mode + '.err.log');
+
+        var builder = new Packages.java.lang.ProcessBuilder(
+            python,
+            qaScript,
+            imageFile.getAbsolutePath(),
+            '--mode',
+            mode,
+            '--out',
+            resultFile.getAbsolutePath()
+        );
+        builder.directory(projectDir);
+        builder.redirectOutput(stdoutLog);
+        builder.redirectError(stderrLog);
+        var process = builder.start();
+        var exitCode = process.waitFor();
+        if (exitCode !== 0 || !resultFile.exists()) {
+            throw new Error('QA inspection failed for ' + imageFile.getAbsolutePath()
+                + ' mode=' + mode
+                + ' exit=' + exitCode
+                + ' stderr=' + stderrLog.getAbsolutePath());
+        }
+        return JSON.parse(readText(resultFile));
+    }
+
+    function moveCameraToXy(camera, x, y) {
+        var currentCameraLocation = camera.getLocation();
+        var location = currentCameraLocation.add(new Location(
+            LengthUnit.Millimeters,
+            x - currentCameraLocation.x,
+            y - currentCameraLocation.y,
+            0,
+            0
+        ));
+        camera.moveTo(location);
+    }
+
+    function inspectPlacedWell(scanDir, scanId, target, targetIndex, totalTargets, statusFile, topCamera, well) {
+        var qaDir = new File(scanDir, 'qa/wells');
+        qaDir.mkdirs();
+        var qaCameraCorrectionX = 23.0;
+        var qaCameraCorrectionY = 0.0;
+        var cameraX = well.x + qaCameraCorrectionX;
+        var cameraY = well.y + qaCameraCorrectionY;
+        var beforeCameraLocation = topCamera.getLocation();
+        var imageName = 'well_' + well.name
+            + '_target_' + pad(targetIndex + 1, 3)
+            + '_' + timestamp()
+            + '_top.png';
+        var imageFile = new File(qaDir, imageName);
+
+        writeStatus(
+            statusFile,
+            'qa',
+            scanId,
+            targetIndex + 1,
+            totalTargets,
+            'Moving Top camera over well ' + well.name
+                + ' after drop: camera X ' + cameraX.toFixed(3)
+                + ', Y ' + cameraY.toFixed(3)
+        );
+        print('POST-DROP QA: moving Top camera to well ' + well.name
+            + ' at camera X=' + cameraX.toFixed(3)
+            + ' Y=' + cameraY.toFixed(3)
+            + ' to inspect N1 drop point X=' + well.x.toFixed(3)
+            + ' Y=' + well.y.toFixed(3)
+            + ' using empirical QA camera correction dX=' + qaCameraCorrectionX.toFixed(3)
+            + ' dY=' + qaCameraCorrectionY.toFixed(3));
+        print('POST-DROP QA: Top camera before move: ' + formatLocation(beforeCameraLocation)
+            + ' delta X=' + (cameraX - beforeCameraLocation.x).toFixed(3)
+            + ' delta Y=' + (cameraY - beforeCameraLocation.y).toFixed(3));
+        moveCameraToXy(topCamera, cameraX, cameraY);
+        print('POST-DROP QA: Top camera after move: ' + formatLocation(topCamera.getLocation()));
+        var image = topCamera.settleAndCapture();
+        ImageIO.write(image, 'PNG', imageFile);
+        print('POST-DROP QA: saved well inspection image: ' + imageFile.getAbsolutePath());
+        var result = runQaInspection(scanDir, imageFile, 'well', targetIndex);
+        print('Well QA for ' + well.name
+            + ': empty=' + result.well_empty
+            + ' bug_present=' + result.bug_present
+            + ' largest_area=' + Number(result.largest_area_px).toFixed(1)
+            + ' dark_fraction=' + Number(result.dark_fraction).toFixed(5));
+        writeQaPreview(
+            scanDir,
+            scanId,
+            target,
+            targetIndex,
+            totalTargets,
+            imageFile,
+            'Well QA ' + well.name + (result.well_empty ? ' | empty' : ' | occupied'),
+            cameraX,
+            cameraY,
+            topCamera.getLocation().z,
+            result
+        );
+        Packages.java.lang.Thread.sleep(1500);
+        return result;
+    }
+
+    function inspectNozzleAfterEmptyWell(scanDir, scanId, target, targetIndex, totalTargets, nozzle, travelZ) {
+        var imageFile = inspectPickedTargetOnBottomCamera(
+            scanDir,
+            scanId,
+            target,
+            targetIndex,
+            totalTargets,
+            nozzle,
+            travelZ
+        );
+        var result = runQaInspection(scanDir, imageFile, 'nozzle', targetIndex);
+        print('Nozzle QA after empty well for target ' + (targetIndex + 1)
+            + ': bug_present=' + result.bug_present
+            + ' largest_area=' + Number(result.largest_area_px).toFixed(1)
+            + ' dark_fraction=' + Number(result.dark_fraction).toFixed(5));
+        writeQaPreview(
+            scanDir,
+            scanId,
+            target,
+            targetIndex,
+            totalTargets,
+            imageFile,
+            'Nozzle QA Target ' + (targetIndex + 1) + (result.bug_present ? ' | stuck bug' : ' | clear'),
+            0,
+            0,
+            -75.0,
+            result
+        );
+        return result;
+    }
+
+    function brushCleanNozzle(nozzle, travelZ) {
+        var brushAX = 196.0;
+        var brushAY = 82.0;
+        var brushBX = 209.0;
+        var brushBY = 86.0;
+        var brushZ = -16.0;
+
+        print('Brush-cleaning N1 between X=' + brushAX.toFixed(3)
+            + ' Y=' + brushAY.toFixed(3)
+            + ' Z=' + brushZ.toFixed(3)
+            + ' and X=' + brushBX.toFixed(3)
+            + ' Y=' + brushBY.toFixed(3)
+            + ' Z=' + brushZ.toFixed(3));
+        moveNozzleToXyAtZ(nozzle, brushAX, brushAY, travelZ);
+        warnDualNozzleZClearance(brushZ, 'brush clean');
+        moveNozzleToXyAtZ(nozzle, brushAX, brushAY, brushZ);
+        for (var pass = 0; pass < 2; pass++) {
+            moveNozzleToXyAtZ(nozzle, brushBX, brushBY, brushZ);
+            moveNozzleToXyAtZ(nozzle, brushAX, brushAY, brushZ);
+        }
+        moveNozzleToXyAtZ(nozzle, brushAX, brushAY, travelZ);
+    }
+
     function releasePartIntoWell(vacuumActuator) {
         setVacuum(vacuumActuator, false);
         print('Vacuum off at well; holding 0.5s release dwell. VAC1 is configured as a Boolean actuator, so no reverse command was sent.');
@@ -1857,10 +2064,11 @@ with (imports) {
         var pickTool = findPickTool(pickHeadName, pickNozzleName);
         var nozzle = pickTool.nozzle;
         var vacuumActuator = findVacuumActuator(pickTool.head, nozzle);
+        var topCamera = findCameraByName('Top');
         var travelZ = nozzle.location.z;
         var touchCorrection = readTouchCorrection();
         var pickZ = touchCorrection.z + 0.5;
-        var dropZ = touchCorrection.z;
+        var dropZ = touchCorrection.z + 3.0;
         var targets = readPickTargets(scanDir);
 
         print('Pick sequence has ' + targets.length + ' unique target(s).');
@@ -1960,6 +2168,55 @@ with (imports) {
             moveNozzleToXyAtZ(nozzle, well.x, well.y, dropZ);
             releasePartIntoWell(vacuumActuator);
             moveNozzleToXyAtZ(nozzle, well.x, well.y, travelZ);
+
+            writeStatus(
+                statusFile,
+                'qa',
+                scanId,
+                i + 1,
+                targets.length,
+                'Checking well ' + well.name + ' after placing target ' + (i + 1)
+            );
+            var wellQa = inspectPlacedWell(
+                scanDir,
+                scanId,
+                target,
+                i,
+                targets.length,
+                statusFile,
+                topCamera,
+                well
+            );
+            if (wellQa.well_empty) {
+                writeStatus(
+                    statusFile,
+                    'qa',
+                    scanId,
+                    i + 1,
+                    targets.length,
+                    'Well ' + well.name + ' appears empty; checking nozzle for stuck bug'
+                );
+                var nozzleQa = inspectNozzleAfterEmptyWell(
+                    scanDir,
+                    scanId,
+                    target,
+                    i,
+                    targets.length,
+                    nozzle,
+                    travelZ
+                );
+                if (nozzleQa.bug_present) {
+                    writeStatus(
+                        statusFile,
+                        'qa',
+                        scanId,
+                        i + 1,
+                        targets.length,
+                        'Bug appears stuck on nozzle; brush-cleaning before next target'
+                    );
+                    brushCleanNozzle(nozzle, travelZ);
+                }
+            }
         }
 
         writeStatus(statusFile, 'completed', scanId, totalFrames, totalFrames, 'Scan and pick/drop sequence completed');
